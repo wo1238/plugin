@@ -4,6 +4,7 @@ import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
@@ -17,6 +18,13 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
         val basePath = project.basePath ?: return
+
+        // CRÍTICO: si el archivo fuente tiene cambios sin guardar en el editor,
+        // File(...).readText() más abajo lee la versión VIEJA desde disco.
+        // Esto fuerza a IntelliJ a volcar todos los buffers abiertos a disco
+        // antes de leer nada, para que SIEMPRE se analice lo último que
+        // escribiste (aunque no hayas hecho Ctrl+S).
+        FileDocumentManager.getInstance().saveAllDocuments()
 
         val selected = e.getData(CommonDataKeys.VIRTUAL_FILE)
         val initialSource = selected?.takeIf { !it.isDirectory }?.path ?: ""
