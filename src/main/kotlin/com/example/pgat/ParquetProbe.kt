@@ -1,10 +1,12 @@
 package com.example.pgat
 
 import java.io.File
+import java.sql.Connection
+import java.util.Properties
 
 /**
- * Todo lo que toca Spark: leer los parquet de muestra y ejecutar las "sondas"
- * (código Spark que reproduce un método) para medir filas y columnas reales.
+ * Lee los parquet de muestra y ejecuta las "sondas" (SQL que reproduce un método)
+ * con DuckDB embebido: no requiere instalar Scala ni Spark en la máquina.
  */
 object ParquetProbe {
 
@@ -52,144 +54,112 @@ object ParquetProbe {
         return if (a.startsWith(b)) a.removePrefix(b) else a
     }
 
-    /** Lee TODOS los parquet de la carpeta con Spark y devuelve filas y columnas reales. */
+    private fun connect(): Connection =
+        org.duckdb.DuckDBDriver().connect("jdbc:duckdb:", Properties())
+            ?: throw IllegalStateException("No se pudo iniciar DuckDB.")
+
+    private fun q(name: String) = "\"" + name.replace("\"", "\"\"") + "\""
+    private fun lit(s: String) = "'" + s.replace("'", "''") + "'"
+
+    private fun createView(conn: Connection, name: String, absPath: String) {
+        conn.createStatement().use { st ->
+            st.execute(
+                "CREATE OR REPLACE VIEW ${q(name)} AS SELECT * FROM read_parquet(" +
+                        "${lit("$absPath/**/*.parquet")}, hive_partitioning=true, union_by_name=true)"
+            )
+        }
+    }
+
+    /** Nombre usable directamente en SQL (letras, números y _; no empieza con número). */
+    private fun sqlName(raw: String): String {
+        val s = raw.replace(Regex("[^A-Za-z0-9_]"), "_")
+        return if (s.isEmpty() || s[0].isDigit()) "_$s" else s
+    }
+
+    /** Lee TODOS los parquet de la carpeta con DuckDB y devuelve filas y columnas reales. */
     fun inspect(root: File, workDir: File): Inspection {
         if (!root.isDirectory) throw IllegalStateException("La carpeta de parquet no existe: ${root.path}")
         val dirs = listDatasets(root)
         if (dirs.isEmpty()) throw IllegalStateException("No se encontraron parquet dentro de: ${root.path}")
 
         val used = HashSet<String>()
-        val named = dirs.map { d ->
-            var name = d.name
-            var i = 2
-            while (!used.add(name)) {
-                name = "${d.name}_$i"
-                i++
-            }
-            Triple(name, d, d.absolutePath.replace("\\", "/"))
-        }
-
-        val paths = named.joinToString(", ") { "\"${it.third}\"" }
-        val script = """
-            import org.apache.spark.sql.SparkSession
-            val spark = SparkSession.builder().master("local[*]").getOrCreate()
-            spark.sparkContext.setLogLevel("ERROR")
-            val paths = Seq($paths)
-            paths.foreach { p =>
-              try {
-                val df = spark.read.parquet(p)
-                println("PGAT_INFO|" + p + "|" + df.count() + "|" + df.columns.mkString(","))
-              } catch { case e: Throwable => println("PGAT_ERR|" + p + "|" + String.valueOf(e.getMessage).replace("\n", " ")) }
-            }
-        """.trimIndent()
-
-        val (_, log) = ScalaRunner.run(script, workDir, 60000, 300)
-
         val infos = ArrayList<Info>()
         val errors = ArrayList<String>()
-        for (line in log.lines()) {
-            val t = line.trim()
-            if (t.startsWith("PGAT_INFO|")) {
-                val p = t.split("|", limit = 4)
-                val entry = named.firstOrNull { it.third == p.getOrNull(1) } ?: continue
-                val rows = p.getOrNull(2)?.toLongOrNull() ?: continue
-                val cols = p.getOrNull(3).orEmpty().split(",").filter { it.isNotBlank() }
-                infos.add(Info(entry.first, relative(entry.second, workDir), entry.third, rows, cols))
-            } else if (t.startsWith("PGAT_ERR|")) {
-                errors.add(t.removePrefix("PGAT_ERR|").take(200))
+
+        connect().use { conn ->
+            for (d in dirs) {
+                val base = sqlName(d.name)
+                var name = base
+                var i = 2
+                while (!used.add(name.lowercase())) {
+                    name = "${base}_$i"
+                    i++
+                }
+                val abs = d.absolutePath.replace("\\", "/")
+                try {
+                    createView(conn, name, abs)
+                    val rows = conn.createStatement().use { st ->
+                        st.executeQuery("SELECT count(*) FROM ${q(name)}").use { rs ->
+                            rs.next()
+                            rs.getLong(1)
+                        }
+                    }
+                    val cols = conn.createStatement().use { st ->
+                        st.executeQuery("SELECT * FROM ${q(name)} LIMIT 0").use { rs ->
+                            val md = rs.metaData
+                            (1..md.columnCount).map { md.getColumnName(it) }
+                        }
+                    }
+                    infos.add(Info(name, relative(d, workDir), abs, rows, cols))
+                } catch (ex: Exception) {
+                    errors.add("${d.name}: ${ex.message.orEmpty().replace("\n", " ").take(200)}")
+                }
             }
         }
 
         if (infos.isEmpty()) {
-            throw IllegalStateException("No se pudo leer ningún parquet con Spark.\n\n" + log.takeLast(1500))
+            throw IllegalStateException("No se pudo leer ningún parquet.\n\n" + errors.joinToString("\n"))
         }
         return Inspection(infos, errors)
     }
 
-    /**
-     * Pega en el script las definiciones de los objects de constantes (Parametry) para que
-     * las sondas usen los valores EXACTOS sin que la IA los copie.
-     */
-    fun companionPreamble(files: List<File>): String {
-        val sb = StringBuilder()
-        val objects = ArrayList<String>()
-        val objRegex = Regex("""(?m)^\s*object\s+(\w+)""")
-        val classRegex = Regex("""(?m)^\s*(case\s+)?class\s""")
-        val qualifier = Regex("""(private|protected)\[[^\]]*\]""")
-
-        for (f in files) {
-            val text = f.readText()
-            if (!objRegex.containsMatchIn(text) || classRegex.containsMatchIn(text)) continue
-            val kept = text.lines().filter { l ->
-                val t = l.trim()
-                !t.startsWith("package ") &&
-                        (!t.startsWith("import ") ||
-                                t.startsWith("import org.apache.") ||
-                                t.startsWith("import scala.") ||
-                                t.startsWith("import java."))
-            }
-            sb.appendLine(qualifier.replace(kept.joinToString("\n"), ""))
-            objRegex.findAll(text).forEach { objects.add(it.groupValues[1]) }
-        }
-        objects.distinct().forEach { sb.appendLine("import $it._") }
-        return sb.toString()
-    }
-
-    private fun probeScript(probes: List<Probe>, preamble: String, infos: List<Info>): String {
-        val pq = infos.joinToString(", ") { "\"${it.name}\" -> \"${it.absPath}\"" }
-        val sb = StringBuilder()
-        sb.appendLine("import org.apache.spark.sql.{DataFrame, SparkSession}")
-        sb.appendLine("import org.apache.spark.sql.functions._")
-        sb.appendLine("val spark = SparkSession.builder().master(\"local[*]\").getOrCreate()")
-        sb.appendLine("spark.sparkContext.setLogLevel(\"ERROR\")")
-        sb.appendLine("import spark.implicits._")
-        sb.appendLine("val PQ: Map[String, String] = Map($pq)")
-        sb.appendLine(preamble)
-        for (p in probes) {
-            sb.appendLine("locally {")
-            sb.appendLine("  try {")
-            sb.appendLine(p.code)
-            sb.appendLine("    println(\"PGAT|${p.key}|\" + result.count() + \"|\" + result.columns.length)")
-            sb.appendLine("  } catch { case e: Throwable => println(\"PGAT_ERR|${p.key}|\" + String.valueOf(e.getMessage).replace(\"\\n\", \" \")) }")
-            sb.appendLine("}")
-        }
-        return sb.toString()
-    }
-
-    private fun collect(log: String, m: MutableMap<String, Measure>, e: MutableMap<String, String>) {
-        for (line in log.lines()) {
-            val t = line.trim()
-            if (t.startsWith("PGAT|")) {
-                val p = t.split("|")
-                val rows = p.getOrNull(2)?.toLongOrNull()
-                val cols = p.getOrNull(3)?.toIntOrNull()
-                if (p.size >= 4 && rows != null && cols != null) m[p[1]] = Measure(rows, cols)
-            } else if (t.startsWith("PGAT_ERR|")) {
-                val p = t.split("|", limit = 3)
-                if (p.size == 3) e[p[1]] = p[2].take(300)
-            }
-        }
-    }
-
-    /** Ejecuta las sondas. Si el script completo no compila, reintenta cada sonda sola para aislar la defectuosa. */
-    fun runProbes(probes: List<Probe>, preamble: String, infos: List<Info>, workDir: File): RunResult {
+    /** Ejecuta las sondas (SQL) sobre los parquet. Cada sonda falla de forma independiente. */
+    fun runProbes(probes: List<Probe>, infos: List<Info>): RunResult {
         if (probes.isEmpty()) return RunResult(emptyMap(), emptyMap())
 
         val measures = LinkedHashMap<String, Measure>()
         val errors = LinkedHashMap<String, String>()
 
-        val (_, log) = ScalaRunner.run(probeScript(probes, preamble, infos), workDir, 40000, 300)
-        collect(log, measures, errors)
+        connect().use { conn ->
+            for (info in infos) {
+                try {
+                    createView(conn, info.name, info.absPath)
+                } catch (ex: Exception) {
+                    // el parquet ya falló en inspect; las sondas que lo usen reportarán el error
+                }
+            }
 
-        val silent = probes.filter { it.key !in measures && it.key !in errors }
-        if (silent.isNotEmpty()) {
-            if (probes.size == 1) {
-                errors[silent[0].key] = log.trim().takeLast(400)
-            } else {
-                for (p in silent) {
-                    val (_, l2) = ScalaRunner.run(probeScript(listOf(p), preamble, infos), workDir, 40000, 300)
-                    collect(l2, measures, errors)
-                    if (p.key !in measures && p.key !in errors) errors[p.key] = l2.trim().takeLast(400)
+            for (p in probes) {
+                try {
+                    val sql = p.code.trim().removeSuffix(";").trim()
+                    val head = sql.lowercase()
+                    require(head.startsWith("select") || head.startsWith("with")) {
+                        "La sonda debe ser un SELECT (o WITH ... SELECT)."
+                    }
+                    val rows = conn.createStatement().use { st ->
+                        st.executeQuery("SELECT count(*) FROM (\n$sql\n) AS pgat_t").use { rs ->
+                            rs.next()
+                            rs.getLong(1)
+                        }
+                    }
+                    val cols = conn.createStatement().use { st ->
+                        st.executeQuery("SELECT * FROM (\n$sql\n) AS pgat_t LIMIT 0").use { rs ->
+                            rs.metaData.columnCount
+                        }
+                    }
+                    measures[p.key] = Measure(rows, cols)
+                } catch (ex: Exception) {
+                    errors[p.key] = ex.message.orEmpty().replace("\n", " ").take(300)
                 }
             }
         }

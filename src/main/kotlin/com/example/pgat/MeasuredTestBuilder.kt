@@ -4,7 +4,7 @@ import java.io.File
 
 /**
  * Genera tests de GetData / Generate con números MEDIDOS:
- *  - La IA devuelve sondas (código Spark) + el test con placeholders {{ROWS:k}} {{COLS:k}} {{MAPSIZE:m}}.
+ *  - La IA devuelve sondas (SQL DuckDB) + el test con placeholders {{ROWS:k}} {{COLS:k}} {{MAPSIZE:m}}.
  *  - ParquetProbe ejecuta las sondas sobre los parquet de muestra.
  *  - Aquí se verifica la respuesta, se reintenta una vez si hay problemas y se sustituyen los números.
  */
@@ -25,16 +25,13 @@ object MeasuredTestBuilder {
     private data class Companions(val imported: List<File>, val siblings: List<File>)
     private class Ctx(
         val testable: List<Method>,
-        val preamble: String,
         val infos: List<ParquetProbe.Info>,
-        val workDir: File,
         val askAi: (String) -> String
     )
 
     private val PH = Regex("""\{\{(ROWS|COLS|MAPSIZE):([A-Za-z0-9_]+)\}\}""")
     private val LEFTOVER = Regex("""\{\{[A-Za-z_]+(:[A-Za-z0-9_]*)?\}\}""")
     private val HARDCODED = Regex("""(count\(\)|\.columns\.length|\.size|\.length)\s*(==|shouldBe|should\s+be)\s*\d+""")
-    private val PQ_REF = Regex("""PQ\("([^"]+)"\)""")
 
     // ------------------------------------------------------------------
     // Análisis del código fuente
@@ -141,8 +138,7 @@ object MeasuredTestBuilder {
         configText: String,
         infos: List<ParquetProbe.Info>,
         testable: List<Method>,
-        mapSizes: Map<String, Int>,
-        hasPreamble: Boolean
+        mapSizes: Map<String, Int>
     ): String {
 
         val parquetLines = infos.joinToString("\n") { i ->
@@ -162,13 +158,8 @@ object MeasuredTestBuilder {
             "- ${m.name}(${m.params}): ${m.returnType}$extra"
         }
 
-        val preambleNote = if (hasPreamble)
-            "- Las constantes de los objects asociados ya están importadas (puedes usar sus nombres directamente)."
-        else
-            "- No hay objects de constantes importables: usa literales tomados del código."
-
         return listOf(
-            "Eres un experto en Scala, Apache Spark y ScalaTest. NO HABLES. NO EXPLIQUES. Sin bloques markdown.",
+            "Eres un experto en Scala, Apache Spark, SQL (DuckDB) y ScalaTest. NO HABLES. NO EXPLIQUES. Sin bloques markdown.",
             "",
             "TIPO DE TEST: $testType",
             "",
@@ -181,7 +172,7 @@ object MeasuredTestBuilder {
             "ARCHIVO .conf DEL TEST (úsalo solo para conocer valores de config como año o mes):",
             configText.ifBlank { "(vacío)" },
             "",
-            "PARQUET DE MUESTRA, YA LEÍDOS CON SPARK (filas y columnas reales):",
+            "PARQUET DE MUESTRA, YA LEÍDOS (cada uno es una tabla SQL con ese nombre; filas y columnas reales):",
             parquetLines,
             "",
             "MÉTODOS QUE DEBES CUBRIR (TODOS, ninguno se puede omitir):",
@@ -191,19 +182,23 @@ object MeasuredTestBuilder {
             "",
             "PARTE 1 - SONDAS. Por cada resultado (DataFrame) cuyas filas/columnas haya que medir escribe:",
             "@@PROBE <clave>",
-            "<código Scala/Spark que reproduce el método sobre los parquet y termina definiendo: val result: DataFrame = ...>",
+            "<UNA sola consulta SQL (DuckDB) que reproduce lo que hace el método y devuelve el mismo resultado>",
             "",
             "Reglas de las sondas:",
-            "- Corren en un script Scala independiente SIN las clases del proyecto. Ya existen: spark (SparkSession),",
-            "  import org.apache.spark.sql.functions._, import spark.implicits._ y PQ: Map[String, String] con la ruta",
-            "  de cada parquet por su nombre.",
-            preambleNote,
-            "- Lee datos SOLO con spark.read.parquet(PQ(\"nombre\")) usando nombres de la lista de parquet de arriba.",
-            "  No uses ReaderWithDataproc ni inventes rutas.",
+            "- Es SQL, no Scala. Una sola sentencia SELECT (o WITH ... SELECT), sin punto y coma final.",
+            "- Las tablas disponibles son EXACTAMENTE los nombres de la lista de parquet de arriba: escríbelos en el FROM",
+            "  (por ejemplo: FROM nombre_del_parquet). No uses rutas, read_parquet ni ReaderWithDataproc.",
             "- Elige el parquet que corresponde a la constante o parámetro con que se llama al método",
-            "  (por nombre y por columnas). Si el método usa varios inputs, lee cada uno.",
-            "- Copia la lógica del método tal cual (mismos select, trim, filtros, joins, fechas).",
-            "  Si usa config.getString(X), reemplázalo por el valor literal que figura en el .conf.",
+            "  (por nombre y por columnas). Si el método usa varios inputs, haz el JOIN o la consulta entre varias tablas.",
+            "- Copia la lógica del método tal cual (mismos select, trim, filtros, joins, fechas, agregaciones).",
+            "- Las constantes de Scala (listas de columnas, nombres de columnas, claves) NO existen en SQL: reemplázalas por",
+            "  sus valores LITERALES tomados de los archivos asociados. Igual con config.getString(X): usa el valor literal del .conf.",
+            "- Equivalencias Spark -> DuckDB: trim(col) -> trim(CAST(col AS VARCHAR)); lpad(col, n, '0') -> lpad(CAST(col AS VARCHAR), n, '0');",
+            "  concat(a, b) -> concat(CAST(a AS VARCHAR), CAST(b AS VARCHAR)); col.as(x) -> col AS x; lit('x') -> 'x'.",
+            "- Filtrar por la partición máxima se escribe con subconsulta, por ejemplo:",
+            "  SELECT <columnas> FROM <tabla> WHERE <expresión_partición> = (SELECT max(<expresión_partición>) FROM <tabla>)",
+            "  y si además hay un corte (<= valor), agrégalo en el WHERE de ambos lados.",
+            "- Los nombres de columnas del resultado deben ser los mismos que produce el método (importa el NÚMERO de columnas).",
             "- La clave es única (letras, números y _). Un método puede tener varias claves.",
             "",
             "PARTE 2 - TEST:",
@@ -297,7 +292,7 @@ object MeasuredTestBuilder {
     private fun attempt(prompt: String, ctx: Ctx): Attempt {
         val parsed = parse(ctx.askAi(prompt))
         val issues = ArrayList(staticIssues(parsed, ctx.testable))
-        val res = ParquetProbe.runProbes(parsed.probes, ctx.preamble, ctx.infos, ctx.workDir)
+        val res = ParquetProbe.runProbes(parsed.probes, ctx.infos)
 
         val probeKeys = parsed.probes.map { it.key }.toSet()
         val used = PH.findAll(parsed.test)
@@ -383,18 +378,17 @@ object MeasuredTestBuilder {
             .toMap()
 
         val comp = findCompanions(basePath, sourceFile, fullSource, spec.sourceName)
-        val preamble = ParquetProbe.companionPreamble(comp.imported)
         val companionsText = (comp.imported + comp.siblings)
             .joinToString("\n\n") { "// Archivo: ${it.name}\n" + it.readText().take(12000) }
 
         val (header, pattern) = TestPromptBuilder.headerAndPattern(testType, pkg, spec, configRel)
         val prompt = buildPrompt(
             testType, pkg, spec, header, pattern, code, companionsText,
-            configText, infos, testable, mapSizes, preamble.isNotBlank()
+            configText, infos, testable, mapSizes
         )
-        val ctx = Ctx(testable, preamble, infos, basePath, askAi)
+        val ctx = Ctx(testable, infos, askAi)
 
-        progress("Consultando a la IA y midiendo con Spark...")
+        progress("Consultando a la IA y midiendo los parquet...")
         val first = attempt(prompt, ctx)
         var best = first
 
@@ -428,8 +422,10 @@ object MeasuredTestBuilder {
             .toList()
         val measured = usedKeys.mapNotNull { k ->
             val m = best.res.measures[k] ?: return@mapNotNull null
-            val code0 = best.parsed.probes.firstOrNull { it.key == k }?.code.orEmpty()
-            val pqs = PQ_REF.findAll(code0).map { it.groupValues[1] }.distinct().joinToString(", ")
+            val sql = best.parsed.probes.firstOrNull { it.key == k }?.code.orEmpty()
+            val pqs = infos
+                .filter { Regex("""\b${Regex.escape(it.name)}\b""", RegexOption.IGNORE_CASE).containsMatchIn(sql) }
+                .joinToString(", ") { it.name }
             "$k: ${m.rows} filas x ${m.cols} columnas" + if (pqs.isNotEmpty()) " (parquet: $pqs)" else ""
         }
 

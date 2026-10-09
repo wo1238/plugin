@@ -13,6 +13,7 @@ repositories {
 
 dependencies {
     implementation("dev.langchain4j:langchain4j:0.35.0")
+    implementation("org.duckdb:duckdb_jdbc:1.1.3")
     implementation("dev.langchain4j:langchain4j-anthropic:0.35.0")
 }
 
