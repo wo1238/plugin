@@ -1,0 +1,22 @@
+<idea-plugin>
+    <id>com.example.ParquetGeneratorAndTest</id>
+    <name>ParquetGeneratorAndTest</name>
+    <vendor email="camilo.giraldo@timia.ai">TIMIA</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <actions>
+        <group id="com.example.pgat.PgatGroup" text="PGAT" popup="true">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+
+            <action id="com.example.pgat.GenerateDataAction"
+                    class="com.example.pgat.GenerateDataAction"
+                    text="Generar Data de Prueba (Parquet)"/>
+
+            <action id="com.example.pgat.GenerateTestAction"
+                    class="com.example.pgat.GenerateTestAction"
+                    text="Generar Test Unitario (ScalaTest)"/>
+        </group>
+    </actions>
+</idea-plugin>
