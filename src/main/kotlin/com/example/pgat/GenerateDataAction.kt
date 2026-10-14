@@ -6,6 +6,7 @@ import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
 import java.io.File
 
@@ -15,85 +16,106 @@ class GenerateDataAction : AnAction("Generar Data de Prueba (Parquet)") {
         val project = e.project ?: return
         val basePath = project.basePath ?: return
 
-        // Si se hizo clic derecho sobre un archivo, se propone como esquema
         val selected = e.getData(CommonDataKeys.VIRTUAL_FILE)
-        val initialSchema = selected?.takeIf { !it.isDirectory }?.path ?: ""
+        val initialSchema = selected?.path ?: ""
 
         val dialog = GenerateDataDialog(basePath, initialSchema)
         if (!dialog.showAndGet()) return
 
-        val isModify = dialog.rbModifyExisting.isSelected
-        val records = dialog.txtRecords.text.trim()
-        val partitions = dialog.comboPartitions.selectedItem.toString()
-        val inputPath = dialog.txtInputPath.text.replace("\\", "/")
-        val outputPath = dialog.txtOutputPath.text.replace("\\", "/")
-        val edgeCases = dialog.checkEdgeCases.isSelected
-        val schemaContent = File(dialog.txtSchemaPath.text).readText()
+        // ---------------- MODIFICAR PARQUET EXISTENTE ----------------
+        if (dialog.isModifyMode) {
+            val inputDir = File(dialog.txtInputPath.text.trim())
+            val column = dialog.selectedModColumn
+            val oldValue: String? = dialog.selectedOldValue
+            val newValue = dialog.txtModNew.text
+            val oldShown = if (oldValue == null) "(nulo)" else "'$oldValue'"
 
-        val partitionInstruction = if (partitions == "Sin Particiones") {
-            "No particiones la salida (no uses partitionBy ni repartition)."
-        } else {
-            "Usa repartition($partitions) antes de escribir."
+            val answer = Messages.showYesNoDialog(
+                project,
+                "Se va a reescribir el parquet:\n${inputDir.path}\n\n" +
+                        "Cambio: $column = $oldShown  ->  '$newValue'\n\n¿Continuar?",
+                "Modificar parquet",
+                Messages.getQuestionIcon()
+            )
+            if (answer != Messages.YES) return
+
+            ProgressManager.getInstance().run(
+                object : Task.Backgroundable(project, "Modificando parquet...", false) {
+                    override fun run(indicator: ProgressIndicator) {
+                        try {
+                            indicator.text = "Leyendo y reescribiendo con DuckDB..."
+                            val r = DataGenerator.modify(inputDir, column, oldValue, newValue)
+                            LocalFileSystem.getInstance().refreshAndFindFileByIoFile(inputDir)?.refresh(true, true)
+
+                            val parts = if (r.partitionCols.isEmpty()) "sin particiones"
+                            else "particiones: " + r.partitionCols.joinToString(", ")
+                            Notifier.info(
+                                project, "Modificar parquet",
+                                "Listo: ${r.changedRows} de ${r.totalRows} filas cambiadas en '$column'.\n" +
+                                        "Se mantuvo la estructura ($parts).\n${r.outputDir.path}"
+                            )
+                        } catch (ex: Exception) {
+                            Notifier.error(project, "Modificar parquet", "Error: ${ex.message}")
+                        }
+                    }
+                }
+            )
+            return
         }
 
-        val operation = if (isModify) {
-            listOf(
-                "1. LEE el parquet existente en '$inputPath'.",
-                "2. Modifícalo para que cumpla el esquema proporcionado.",
-                "3. Guárdalo (modo overwrite) en '$outputPath'.",
-                "4. $partitionInstruction"
-            )
-        } else {
-            listOf(
-                "1. GENERA $records registros mockeados que respeten exactamente el esquema.",
-                if (edgeCases) {
-                    "2. Incluye casos de borde: nulos, strings vacíos y valores extremos."
-                } else {
-                    "2. Usa solo valores válidos y realistas."
-                },
-                "3. Guárdalo en formato parquet (modo overwrite) en '$outputPath'.",
-                "4. $partitionInstruction"
-            )
-        }.joinToString("\n")
+        // ---------------- GENERAR DATA NUEVA ----------------
+        val schema = dialog.schema ?: return
+        val specs = dialog.collectSpecs()
+        val records = dialog.txtRecords.text.toIntOrNull() ?: 100
+        val outputRoot = File(dialog.txtOutputPath.text.trim())
+        val target = File(outputRoot, schema.name)
 
-        val prompt = listOf(
-            "Eres un experto en Scala y Apache Spark. NO HABLES. NO EXPLIQUES. Devuelve SOLO un script Scala válido, sin bloques markdown.",
-            "",
-            "Esquema:",
-            schemaContent,
-            "",
-            "Tarea:",
-            operation,
-            "",
-            "Importa 'org.apache.spark.sql.functions._' y crea la sesión con:",
-            "val spark = org.apache.spark.sql.SparkSession.builder().master(\"local[*]\").getOrCreate()"
-        ).joinToString("\n")
+        if (target.exists()) {
+            val answer = Messages.showYesNoDialog(
+                project,
+                "La carpeta ya existe y se va a reemplazar:\n${target.path}\n\n¿Continuar?",
+                "Generar data de prueba",
+                Messages.getWarningIcon()
+            )
+            if (answer != Messages.YES) return
+        }
+
+        val request = GenerateRequest(
+            schema = schema,
+            specs = specs,
+            records = records,
+            edgeCases = dialog.checkEdgeCases.isSelected,
+            storage = dialog.partitionStorage,
+            outputRoot = outputRoot
+        )
+        val usesAi = specs.any { it.mode == FieldMode.AI && !it.partition }
 
         ProgressManager.getInstance().run(
             object : Task.Backgroundable(project, "Generando data de prueba...", false) {
                 override fun run(indicator: ProgressIndicator) {
                     try {
-                        indicator.text = "Consultando a la IA..."
-                        val script = AiClient.cleanCode(AiClient.ask(prompt))
-                        if (script.isEmpty()) {
-                            Notifier.error(project, "Generar Data", "La IA devolvió una respuesta vacía.")
-                            return
+                        indicator.text = if (usesAi) "Pidiendo valores a la IA y generando parquet..."
+                        else "Generando parquet con DuckDB..."
+
+                        val r = DataGenerator.generate(request) { p -> AiClient.cleanCode(AiClient.ask(p)) }
+
+                        LocalFileSystem.getInstance().refreshAndFindFileByIoFile(r.outputDir)?.refresh(true, true)
+
+                        val sb = StringBuilder()
+                        sb.append("${schema.name}\n\n")
+                        sb.append("- ${r.rows} registros, ${r.files} archivo(s) parquet\n")
+                        sb.append(
+                            if (r.partitionCols.isEmpty()) "- Sin carpetas de partición\n"
+                            else "- Particiones en carpetas: ${r.partitionCols.joinToString(", ")}\n"
+                        )
+                        sb.append("- Ruta: ${r.outputDir.path}\n")
+                        if (r.warnings.isNotEmpty()) {
+                            sb.append("\nRevisar:\n")
+                            r.warnings.forEach { sb.append("- $it\n") }
                         }
-
-                        indicator.text = "Ejecutando script Scala/Spark..."
-                        val (ok, log) = ScalaRunner.run(script, File(basePath))
-
-                        LocalFileSystem.getInstance()
-                            .refreshAndFindFileByIoFile(File(outputPath))
-                            ?.refresh(true, true)
-
-                        if (ok) {
-                            Notifier.info(project, "Generar Data", "Parquet generado en:\n$outputPath")
-                        } else {
-                            Notifier.error(project, "Generar Data", "Falló la ejecución del script:\n\n$log")
-                        }
+                        Notifier.info(project, "Generar data de prueba", sb.toString())
                     } catch (ex: Exception) {
-                        Notifier.error(project, "Generar Data", "Error: ${ex.message}")
+                        Notifier.error(project, "Generar data de prueba", "Error: ${ex.message}")
                     }
                 }
             }
