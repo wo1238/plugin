@@ -51,7 +51,6 @@ class GenerateDataDialog(private val basePath: String, initialSchemaPath: String
         private const val COL_PART = 2
         private const val COL_MODE = 3
         private const val COL_TEXT = 4
-
         private const val M_AUTO = "Automático"
         private const val M_AI = "IA"
         private const val M_VALUES = "Valores"
@@ -169,13 +168,14 @@ class GenerateDataDialog(private val basePath: String, initialSchemaPath: String
 
         // El esquema inicial puede ser un archivo .schema o una carpeta
         val initial = File(initialSchemaPath)
+        val initialView = LongPaths.resolve(initial, true)
         var preselect: File? = null
         when {
-            initialSchemaPath.isNotBlank() && initial.isFile && initial.name.endsWith(".schema", true) -> {
+            initialSchemaPath.isNotBlank() && initialView.isFile && initial.name.endsWith(".schema", true) -> {
                 txtSchemaFolder.text = initial.parentFile?.absolutePath.orEmpty()
                 preselect = initial
             }
-            initialSchemaPath.isNotBlank() && initial.isDirectory -> txtSchemaFolder.text = initial.absolutePath
+            initialSchemaPath.isNotBlank() && initialView.isDirectory -> txtSchemaFolder.text = initial.absolutePath
         }
 
         txtSchemaFolder.textField.document.addDocumentListener(object : DocumentAdapter() {
@@ -395,7 +395,7 @@ class GenerateDataDialog(private val basePath: String, initialSchemaPath: String
         modColumns = emptyList()
         lblColInfo.text = " "
 
-        if (!dir.isDirectory) {
+        if (!LongPaths.resolve(dir, true).isDirectory) {
             lblModInfo.text = if (txtInputPath.text.isBlank()) " " else "La carpeta no existe."
             return
         }
@@ -501,7 +501,7 @@ class GenerateDataDialog(private val basePath: String, initialSchemaPath: String
         table.cellEditor?.stopCellEditing()
 
         if (!isModifyMode) {
-            if (!File(txtSchemaFolder.text.trim()).isDirectory) {
+            if (!LongPaths.resolve(File(txtSchemaFolder.text.trim()), true).isDirectory) {
                 return ValidationInfo("Selecciona la carpeta que contiene los .schema.", txtSchemaFolder)
             }
             if (schema == null) {
@@ -514,7 +514,7 @@ class GenerateDataDialog(private val basePath: String, initialSchemaPath: String
                 return ValidationInfo("Selecciona el directorio de salida.", txtOutputPath)
             }
         } else {
-            if (!File(txtInputPath.text.trim()).isDirectory) {
+            if (!LongPaths.resolve(File(txtInputPath.text.trim()), true).isDirectory) {
                 return ValidationInfo("Selecciona la carpeta del parquet a modificar.", txtInputPath)
             }
             if (parquetInfo == null) {

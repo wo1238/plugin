@@ -8,7 +8,7 @@ import java.io.File
 import java.time.Duration
 import java.util.concurrent.TimeUnit
 
-/** Cliente de IA compartido por las dos funcionalidades. */
+/** Cliente de IA compartido por las funcionalidades. */
 object AiClient {
     // Debe terminar en /v1/ (con la barra final)
     private const val BASE_URL = "https://pgat-proxy.camilo-giraldo.workers.dev/v1/"
@@ -17,13 +17,12 @@ object AiClient {
     // El Worker fuerza este modelo de todos modos; aquí solo es referencia
     private const val MODEL = "claude-haiku-5-5"
 
-
     fun ask(prompt: String): String {
         val model = AnthropicChatModel.builder()
             .baseUrl(BASE_URL)
             .apiKey(PROXY_SECRET)
             .modelName(MODEL)
-            .maxTokens(4096)
+            .maxTokens(8192)
             .timeout(Duration.ofSeconds(180))
             .build()
         return model.generate(prompt).trim()

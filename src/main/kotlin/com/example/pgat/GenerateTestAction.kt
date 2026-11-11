@@ -19,11 +19,7 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
         val project = e.project ?: return
         val basePath = project.basePath ?: return
 
-        // CRÍTICO: si el archivo fuente tiene cambios sin guardar en el editor,
-        // File(...).readText() más abajo lee la versión VIEJA desde disco.
-        // Esto fuerza a IntelliJ a volcar todos los buffers abiertos a disco
-        // antes de leer nada, para que SIEMPRE se analice lo último que
-        // escribiste (aunque no hayas hecho Ctrl+S).
+        // Guarda los buffers abiertos para analizar siempre la última versión del código.
         FileDocumentManager.getInstance().saveAllDocuments()
 
         val selected = e.getData(CommonDataKeys.VIRTUAL_FILE)
@@ -41,7 +37,8 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
         }
 
         val sourceFile = File(dialog.txtSourcePath.text)
-        val fullSource = if (sourceFile.isFile) sourceFile.readText() else ""
+        val sourceView = LongPaths.resolve(sourceFile, true)
+        val fullSource = if (sourceView.isFile) sourceView.readText() else ""
 
         // Parametry siempre analiza el archivo COMPLETO, nunca solo la selección.
         val code = if (testType != "Parametry" && dialog.chkUseSelection.isSelected && hasSelection) {
@@ -81,9 +78,9 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
 
                             indicator.text = "Guardando test..."
                             val testDir = File(testOutputPath)
-                            testDir.mkdirs()
+                            LongPaths.resolve(testDir, true).mkdirs()
                             val testFile = File(testDir, spec.testFileName)
-                            testFile.writeText(result.code)
+                            LongPaths.resolve(testFile, true).writeText(result.code)
 
                             LocalFileSystem.getInstance().refreshAndFindFileByIoFile(testFile)?.let { vf ->
                                 ApplicationManager.getApplication().invokeLater {
@@ -111,7 +108,7 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
             return
         }
 
-        // ---------------- GETDATA / GENERATE (con números medidos) ----------------
+        // ---------------- GETDATA / GENERATE ----------------
         if (!TestApplicability.isApplicable(testType, code)) {
             val answer = Messages.showYesNoDialog(
                 project,
@@ -123,7 +120,14 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
             if (answer != Messages.YES) return
         }
 
-        val parquetRoot = File(dialog.txtParquetPath.text)
+        // GetData: solo inputs. Generate: unit test + inputs.
+        val inputRoot = File(dialog.txtInputPath.text)
+        val parquetRoots: List<File> = if (testType == "Generate") {
+            listOf(File(dialog.txtParquetPath.text), inputRoot)
+        } else {
+            listOf(inputRoot)
+        }
+
         val configFile = File(dialog.txtConfigPath.text)
         val configRel = runCatching { configFile.relativeTo(File(basePath)).path }
             .getOrDefault(configFile.path)
@@ -133,8 +137,8 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
             object : Task.Backgroundable(project, "Generando test de $testType...", false) {
                 override fun run(indicator: ProgressIndicator) {
                     try {
-                        indicator.text = "Leyendo parquet de muestra con Spark..."
-                        val inspection = ParquetProbe.inspect(parquetRoot, File(basePath))
+                        indicator.text = "Leyendo parquet de muestra con DuckDB..."
+                        val inspection = ParquetProbe.inspect(parquetRoots, File(basePath))
 
                         val out = MeasuredTestBuilder.build(
                             testType = testType,
@@ -145,18 +149,21 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
                             sourceFile = sourceFile,
                             basePath = File(basePath),
                             configRel = configRel,
-                            configText = configFile.readText().take(8000),
+                            configText = LongPaths.resolve(configFile, true).readText(),
                             infos = inspection.infos,
                             focus = methodName,
                             progress = { msg -> indicator.text = msg },
                             askAi = { p -> AiClient.cleanCode(AiClient.ask(p)) }
                         )
 
+                        // Si la clase quedó incompleta, se guarda como borrador para no dejar un .scala roto.
+                        val fileName = if (out.complete) spec.testFileName else spec.testFileName + ".draft"
+
                         indicator.text = "Guardando test..."
                         val testDir = File(testOutputPath)
-                        testDir.mkdirs()
-                        val testFile = File(testDir, spec.testFileName)
-                        testFile.writeText(out.code)
+                        LongPaths.resolve(testDir, true).mkdirs()
+                        val testFile = File(testDir, fileName)
+                        LongPaths.resolve(testFile, true).writeText(out.code)
 
                         LocalFileSystem.getInstance().refreshAndFindFileByIoFile(testFile)?.let { vf ->
                             ApplicationManager.getApplication().invokeLater {
@@ -165,7 +172,11 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
                         }
 
                         val sb = StringBuilder()
-                        sb.append("${spec.testFileName}\n\nMedido con Spark sobre tus parquet:\n")
+                        sb.append("$fileName\n\n")
+                        if (!out.complete) {
+                            sb.append("INCOMPLETO: guardado como borrador (.draft). Revisa la sección REVISAR.\n\n")
+                        }
+                        sb.append("Medido sobre tus parquet:\n")
                         if (out.measured.isEmpty()) sb.append("- (ninguna medición)\n")
                         out.measured.forEach { sb.append("- $it\n") }
 

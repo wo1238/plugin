@@ -291,9 +291,10 @@ object DataGenerator {
 
         val select = "SELECT\n  " + exprs.joinToString(",\n  ") + "\nFROM range(${req.records}) t(pgat_i)"
 
+        // Ruta corta en Windows (si la carpeta ya existía, se vacía su contenido)
         val outDir = File(req.outputRoot, req.schema.name)
-        if (outDir.exists()) outDir.deleteRecursively()
-        outDir.absoluteFile.parentFile?.mkdirs()
+        val outView = LongPaths.resolve(outDir, true).also { it.mkdirs() }
+        outView.listFiles()?.forEach { it.deleteRecursively() }
 
         val usePartitions = req.storage == PartitionStorage.FOLDERS && partCols.isNotEmpty()
         var rows = 0L
@@ -303,19 +304,18 @@ object DataGenerator {
             if (usePartitions) {
                 exec(
                     conn,
-                    "COPY ($select) TO ${lit(path(outDir))} " +
+                    "COPY ($select) TO ${lit(path(outView))} " +
                             "(FORMAT PARQUET, COMPRESSION SNAPPY, PARTITION_BY (${partCols.joinToString(", ") { q(it) }}))"
                 )
             } else {
-                outDir.mkdirs()
                 exec(
                     conn,
-                    "COPY ($select) TO ${lit(path(File(outDir, "part-00000.parquet")))} (FORMAT PARQUET, COMPRESSION SNAPPY)"
+                    "COPY ($select) TO ${lit(path(File(outView, "part-00000.parquet")))} (FORMAT PARQUET, COMPRESSION SNAPPY)"
                 )
             }
             rows = scalarLong(
                 conn,
-                "SELECT count(*) FROM read_parquet(${lit(path(outDir) + "/**/*.parquet")}, " +
+                "SELECT count(*) FROM read_parquet(${lit(path(outView) + "/**/*.parquet")}, " +
                         "hive_partitioning=true, union_by_name=true)"
             )
         }
@@ -323,7 +323,7 @@ object DataGenerator {
         if (rows != req.records.toLong()) {
             warnings.add("Se pidieron ${req.records} registros y el parquet tiene $rows.")
         }
-        return GenerateResult(outDir, rows, if (usePartitions) partCols else emptyList(), countParquet(outDir), warnings)
+        return GenerateResult(outDir, rows, if (usePartitions) partCols else emptyList(), countParquet(outView), warnings)
     }
 
     // ------------------------------------------------------------------
@@ -363,8 +363,9 @@ object DataGenerator {
     }
 
     /** Columnas (con su tipo), particiones y total de filas de un parquet existente. */
-    fun inspect(dir: File): ParquetInfo {
-        if (!dir.isDirectory) throw IllegalStateException("La carpeta no existe: ${dir.path}")
+    fun inspect(dir0: File): ParquetInfo {
+        val dir = LongPaths.resolve(dir0, true)
+        if (!dir.isDirectory) throw IllegalStateException("La carpeta no existe: ${dir0.path}")
         if (countParquet(dir) == 0) throw IllegalStateException("No hay archivos .parquet en esa carpeta.")
         val parts = detectPartitions(dir)
         connect().use { conn ->
@@ -385,7 +386,8 @@ object DataGenerator {
     }
 
     /** Valores que tiene hoy una columna (los [limit] más frecuentes) con su cantidad de filas. */
-    fun distinctValues(dir: File, column: String, limit: Int = 200): ColumnValues {
+    fun distinctValues(dir0: File, column: String, limit: Int = 200): ColumnValues {
+        val dir = LongPaths.resolve(dir0, true)
         val parts = detectPartitions(dir)
         connect().use { conn ->
             val srcSql = openSource(conn, dir, parts)
@@ -408,16 +410,19 @@ object DataGenerator {
 
     /**
      * Cambia en [column] el valor [oldValue] por [newValue] y reescribe el parquet respetando sus particiones.
-     * Escribe primero a una carpeta temporal y luego la reemplaza (no se puede sobrescribir lo que se está leyendo).
+     * Escribe primero a una carpeta temporal y luego copia el resultado sobre la original.
      */
-    fun modify(inputDir: File, column: String, oldValue: String?, newValue: String): ModifyResult {
-        if (!inputDir.isDirectory) throw IllegalStateException("La carpeta del parquet no existe: ${inputDir.path}")
+    fun modify(inputDir0: File, column: String, oldValue: String?, newValue: String): ModifyResult {
+        if (!inputDir0.isDirectory) throw IllegalStateException("La carpeta del parquet no existe: ${inputDir0.path}")
         if (column.isBlank()) throw IllegalStateException("Indica la columna a modificar.")
 
-        val parts = detectPartitions(inputDir)
-        val tmp = File(inputDir.absoluteFile.parentFile, inputDir.name + "__pgat_tmp")
+        val inputDir = LongPaths.resolve(inputDir0, true)
+        val parent = inputDir0.absoluteFile.parentFile
+            ?: throw IllegalStateException("Ruta inválida: ${inputDir0.path}")
+        val tmp = File(LongPaths.resolve(parent, true), inputDir0.name + "__pgat_tmp")
         if (tmp.exists()) tmp.deleteRecursively()
 
+        val parts = detectPartitions(inputDir)
         var changed = 0L
         var total = 0L
 
@@ -431,7 +436,6 @@ object DataGenerator {
                 return "read_parquet(${lit(path(inputDir) + "/**/*.parquet")}, hive_partitioning=true, union_by_name=true$types)"
             }
 
-            // Las particiones se leen como texto para no perder ceros ('01' no debe volverse 1).
             var srcSql = src(true)
             try {
                 total = scalarLong(conn, "SELECT count(*) FROM $srcSql")
@@ -494,12 +498,12 @@ object DataGenerator {
             }
         }
 
-        // Reemplazo (la conexión ya está cerrada, no quedan archivos bloqueados).
-        inputDir.deleteRecursively()
-        if (!tmp.renameTo(inputDir)) {
-            tmp.copyRecursively(inputDir, overwrite = true)
-            tmp.deleteRecursively()
-        }
-        return ModifyResult(inputDir, changed, total, parts)
+        // Reemplazo: vaciar el contenido original y copiar lo nuevo. Se trabaja dentro de la carpeta
+        // (no se borra la raíz) para que siga funcionando si está mapeada con una letra de unidad.
+        inputDir.listFiles()?.forEach { it.deleteRecursively() }
+        tmp.listFiles()?.forEach { it.copyRecursively(File(inputDir, it.name), overwrite = true) }
+        tmp.deleteRecursively()
+
+        return ModifyResult(inputDir0, changed, total, parts)
     }
 }

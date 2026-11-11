@@ -43,13 +43,17 @@ object SchemaReader {
 
     /** Lista los archivos .schema de una carpeta (hasta 3 niveles de profundidad). */
     fun listSchemas(folder: File): List<File> {
-        if (!folder.isDirectory) return emptyList()
+        // Se recorre con ruta corta; se devuelven rutas originales (las que ve el usuario)
+        val view = LongPaths.resolve(folder, true)
+        if (!view.isDirectory) return emptyList()
         val skip = setOf("target", ".git", ".idea", "node_modules", "build", "out")
+        val viewRoot = view.absolutePath.trimEnd('\\', '/')
         return try {
-            folder.walkTopDown()
+            view.walkTopDown()
                 .maxDepth(3)
                 .onEnter { it.name !in skip }
                 .filter { it.isFile && it.name.endsWith(".schema", ignoreCase = true) }
+                .map { File(folder, it.absolutePath.removePrefix(viewRoot).trimStart('\\', '/')) }
                 .sortedBy { it.absolutePath }
                 .toList()
         } catch (ex: Exception) {
@@ -85,7 +89,8 @@ object SchemaReader {
         o.get(key)?.takeIf { it.isJsonPrimitive }?.asBoolean ?: false
 
     fun read(file: File): SchemaDef {
-        val root = JsonParser.parseString(file.readText(Charsets.UTF_8).removePrefix("\uFEFF")).asJsonObject
+        val text = LongPaths.resolve(file, true).readText(Charsets.UTF_8).removePrefix("\uFEFF")
+        val root = JsonParser.parseString(text).asJsonObject
 
         val name = str(root, "name") ?: file.nameWithoutExtension
         val doc = str(root, "doc").orEmpty()

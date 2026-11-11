@@ -15,7 +15,8 @@ object ParquetProbe {
         val relPath: String,
         val absPath: String,
         val rows: Long,
-        val columns: List<String>
+        val columns: List<String>,
+        val colTypes: List<String> = emptyList()
     )
 
     data class Inspection(val infos: List<Info>, val errors: List<String>)
@@ -76,43 +77,68 @@ object ParquetProbe {
         return if (s.isEmpty() || s[0].isDigit()) "_$s" else s
     }
 
-    /** Lee TODOS los parquet de la carpeta con DuckDB y devuelve filas y columnas reales. */
-    fun inspect(root: File, workDir: File): Inspection {
-        if (!root.isDirectory) throw IllegalStateException("La carpeta de parquet no existe: ${root.path}")
-        val dirs = listDatasets(root)
-        if (dirs.isEmpty()) throw IllegalStateException("No se encontraron parquet dentro de: ${root.path}")
+    /** Lee TODOS los parquet de una carpeta con DuckDB y devuelve filas y columnas reales. */
+    fun inspect(root: File, workDir: File): Inspection = inspect(listOf(root), workDir)
 
+    /**
+     * Lee los parquet de VARIAS carpetas (por ejemplo: unit test + inputs) y los junta en una sola lista.
+     * Los nombres de tabla son únicos entre carpetas, y un mismo dataset no se repite si una carpeta
+     * está dentro de otra o se eligió dos veces.
+     */
+    fun inspect(roots: List<File>, workDir: File): Inspection {
         val used = HashSet<String>()
+        val seen = HashSet<String>()
         val infos = ArrayList<Info>()
         val errors = ArrayList<String>()
 
+        val uniqueRoots = roots.distinctBy { it.absolutePath.replace("\\", "/").trimEnd('/').lowercase() }
+
         connect().use { conn ->
-            for (d in dirs) {
-                val base = sqlName(d.name)
-                var name = base
-                var i = 2
-                while (!used.add(name.lowercase())) {
-                    name = "${base}_$i"
-                    i++
-                }
-                val abs = d.absolutePath.replace("\\", "/")
-                try {
-                    createView(conn, name, abs)
-                    val rows = conn.createStatement().use { st ->
-                        st.executeQuery("SELECT count(*) FROM ${q(name)}").use { rs ->
-                            rs.next()
-                            rs.getLong(1)
-                        }
+            for (root in uniqueRoots) {
+                // Ruta corta para DuckDB; la original se conserva para mostrársela al usuario.
+                val view = LongPaths.resolve(root, true)
+                if (!view.isDirectory) throw IllegalStateException("La carpeta de parquet no existe: ${root.path}")
+                val dirs = listDatasets(view)
+                if (dirs.isEmpty()) throw IllegalStateException("No se encontraron parquet dentro de: ${root.path}")
+
+                val rootRel = relative(root, workDir)
+                val viewRoot = view.absolutePath.replace("\\", "/").trimEnd('/')
+
+                for (d in dirs) {
+                    val abs = d.absolutePath.replace("\\", "/")
+                    if (!seen.add(abs.lowercase())) continue // ya leído desde otra carpeta
+
+                    // Nombre de la tabla = lo que va antes del primer punto (lo demás es la partición)
+                    val nm = d.name.substringBefore('.').ifEmpty { root.name }
+                    val base = sqlName(nm)
+                    var name = base
+                    var i = 2
+                    while (!used.add(name.lowercase())) {
+                        name = "${base}_$i"
+                        i++
                     }
-                    val cols = conn.createStatement().use { st ->
-                        st.executeQuery("SELECT * FROM ${q(name)} LIMIT 0").use { rs ->
-                            val md = rs.metaData
-                            (1..md.columnCount).map { md.getColumnName(it) }
+                    val sub = abs.removePrefix(viewRoot).trimStart('/')
+                    val rel = if (sub.isEmpty()) rootRel else "$rootRel/$sub"
+                    try {
+                        createView(conn, name, abs)
+                        val rows = conn.createStatement().use { st ->
+                            st.executeQuery("SELECT count(*) FROM ${q(name)}").use { rs ->
+                                rs.next()
+                                rs.getLong(1)
+                            }
                         }
+                        val (cols, types) = conn.createStatement().use { st ->
+                            st.executeQuery("SELECT * FROM ${q(name)} LIMIT 0").use { rs ->
+                                val md = rs.metaData
+                                val names = (1..md.columnCount).map { md.getColumnName(it) }
+                                val typeNames = (1..md.columnCount).map { md.getColumnTypeName(it) }
+                                Pair(names, typeNames)
+                            }
+                        }
+                        infos.add(Info(name, rel, abs, rows, cols, types))
+                    } catch (ex: Exception) {
+                        errors.add("${nm}: ${ex.message.orEmpty().replace("\n", " ").take(200)}")
                     }
-                    infos.add(Info(name, relative(d, workDir), abs, rows, cols))
-                } catch (ex: Exception) {
-                    errors.add("${d.name}: ${ex.message.orEmpty().replace("\n", " ").take(200)}")
                 }
             }
         }
