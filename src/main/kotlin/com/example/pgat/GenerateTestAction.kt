@@ -47,9 +47,14 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
             fullSource
         }
 
-        val pkg = Regex("""package\s+([\w.]+)""").find(fullSource)?.groupValues?.get(1) ?: "(no detectado)"
         val methodName = dialog.txtMethod.text.trim()
         val testOutputPath = dialog.txtTestOutputPath.text.replace("\\", "/")
+        val testDir = File(testOutputPath)
+
+        // El package del test se toma de la ruta donde se va a escribir el archivo de test (desde com/org/co o después de src/test/scala).
+        // Si no se pudiera deducir de la ruta, usa como respaldo el package del archivo fuente.
+        val sourcePkg = TestPromptBuilder.extractPackage(fullSource)
+        val pkg = TestPromptBuilder.packageFromOutputPath(testDir, sourcePkg).ifEmpty { "(no detectado)" }
 
         val spec = TestPromptBuilder.resolveTestSpec(sourceFile, fullSource)
 
@@ -73,11 +78,15 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
                         try {
                             indicator.text = "Generando asserts (local + IA solo en casos ambiguos)..."
                             val result = TestPromptBuilder.buildParametryTestCode(
-                                pkg, spec, fullSource
+                                pkg = pkg,
+                                spec = spec,
+                                fullSource = fullSource,
+                                basePath = File(basePath),
+                                sourceFile = sourceFile,
+                                outputFileOrDir = testDir
                             ) { p -> AiClient.cleanCode(AiClient.ask(p)) }
 
                             indicator.text = "Guardando test..."
-                            val testDir = File(testOutputPath)
                             LongPaths.resolve(testDir, true).mkdirs()
                             val testFile = File(testDir, spec.testFileName)
                             LongPaths.resolve(testFile, true).writeText(result.code)
@@ -129,9 +138,13 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
         }
 
         val configFile = File(dialog.txtConfigPath.text)
-        val configRel = runCatching { configFile.relativeTo(File(basePath)).path }
+        val rawConfigRel = runCatching { configFile.relativeTo(File(basePath)).path }
             .getOrDefault(configFile.path)
             .replace("\\", "/")
+        // Corta cualquier prefijo de submódulo antes de "src/" para que siempre empiece desde "src/test/resources/..."
+        val configRel = rawConfigRel.indexOf("src/").let { idx ->
+            if (idx >= 0) rawConfigRel.substring(idx) else rawConfigRel
+        }
 
         ProgressManager.getInstance().run(
             object : Task.Backgroundable(project, "Generando test de $testType...", false) {
@@ -153,14 +166,14 @@ class GenerateTestAction : AnAction("Generar Test Unitario (ScalaTest)") {
                             infos = inspection.infos,
                             focus = methodName,
                             progress = { msg -> indicator.text = msg },
-                            askAi = { p -> AiClient.cleanCode(AiClient.ask(p)) }
+                            askAi = { p -> AiClient.cleanCode(AiClient.ask(p)) },
+                            outputFileOrDir = testDir
                         )
 
                         // Si la clase quedó incompleta, se guarda como borrador para no dejar un .scala roto.
                         val fileName = if (out.complete) spec.testFileName else spec.testFileName + ".draft"
 
                         indicator.text = "Guardando test..."
-                        val testDir = File(testOutputPath)
                         LongPaths.resolve(testDir, true).mkdirs()
                         val testFile = File(testDir, fileName)
                         LongPaths.resolve(testFile, true).writeText(out.code)

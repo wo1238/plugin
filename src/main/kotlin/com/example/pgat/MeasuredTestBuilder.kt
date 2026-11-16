@@ -3,10 +3,11 @@ package com.example.pgat
 import java.io.File
 
 /**
- * Genera tests de GetData / Generate con números MEDIDOS.
+ * Genera tests de GetData / Generate con números MEDIDOS en DuckDB.
  *  - Los métodos se piden a la IA en lotes pequeños (BATCH_SIZE). Si un lote falla o le faltan métodos,
  *    se reintenta método por método (runBatch).
- *  - Los inputs de cada método (inputsDf(CONSTANTE)) se resuelven sin IA: constante -> .conf -> parquet.
+ *  - Los inputs de cada método, las constantes (String y List[String]) y los valores del .conf se resuelven
+ *    determinísticamente sin IA, y DuckDB pre-ejecuta las sondas SQL sobre los parquet reales.
  *  - Para Generate se incluye también la clase GetData que arma el Map de entrada.
  *  - Métodos compuestos (que terminan llamando a otro método de la clase, p. ej. apply -> joinFinal):
  *    no se piden a la IA. Su test usa los mismos números que el último paso, así que coinciden por construcción.
@@ -60,7 +61,9 @@ object MeasuredTestBuilder {
         val testable: List<Method>,
         val infos: List<ParquetProbe.Info>,
         val askAi: (String) -> String,
-        val sites: Map<String, List<CallSiteResolver.Site>>
+        val sites: Map<String, List<CallSiteResolver.Site>>,
+        val preMeasured: Map<String, ParquetProbe.Measure>,
+        val preProbes: Map<String, ParquetProbe.Probe>
     )
 
     private class Job(
@@ -75,23 +78,27 @@ object MeasuredTestBuilder {
         val infos: List<ParquetProbe.Info>,
         val mapSizes: Map<String, Int>,
         val sites: Map<String, List<CallSiteResolver.Site>>,
+        val preMeasured: Map<String, ParquetProbe.Measure>,
+        val preProbes: Map<String, ParquetProbe.Probe>,
+        val resolvedConstsText: String,
         val inputs: Map<String, List<InputRef>>,
         val composites: Map<String, String>,
         val fullSource: String,
+        val sourceFile: File,
+        val basePath: File,
         val askAi: (String) -> String
     )
 
     private val PH = Regex("""\{\{(ROWS|COLS|MAPSIZE):([A-Za-z0-9_]+)\}\}""")
     private val LEFTOVER = Regex("""\{\{[A-Za-z_]+(:[A-Za-z0-9_]*)?\}\}""")
     private val HARDCODED = Regex("""(count\(\)|\.columns\.length|\.size|\.length)\s*(==|shouldBe|should\s+be)\s*\d+""")
-    // FROM/JOIN con nombre simple o calificado: tabla, "tabla", esquema.tabla, "esquema"."tabla"
     private val FROM_REGEX = Regex(
         """(?i)\b(?:from|join)\s+((?:\x22?[A-Za-z_][A-Za-z0-9_]*\x22?\s*\.\s*)*\x22?[A-Za-z_][A-Za-z0-9_]*\x22?)"""
     )
     private val READ_PQ = Regex("""read\s*\.\s*parquet\s*\(\s*\x22([^\x22]+)\x22""")
     private val BLOCK_START = Regex("""(?m)^[ \t]*\x22[^\x22\n]*\x22\s+should\s+\x22""")
     private val BLOCK_NUMBER = Regex("""(?m)^([ \t]*\x22)(?:\d+|\{\{N\}\})\.""")
-    private val INPUT_REGEX = Regex("""inputsDf\(\s*([A-Z][A-Z0-9_]*)\s*\)""")
+    private val INPUT_REGEX = Regex("""inputsDf\(\s*(?:[A-Za-z0-9_]+\s*\.\s*)*([A-Z][A-Z0-9_]*)\s*\)""")
 
     // ------------------------------------------------------------------
     // Análisis del código fuente
@@ -139,7 +146,7 @@ object MeasuredTestBuilder {
         val cache = HashMap<String, InputRef>()
         fun ref(n: String): InputRef = cache.getOrPut(n) {
             val value = constants[n].orEmpty()
-            val hit = if (value.isEmpty()) emptySet() else CallSiteResolver.tablesFor(n, value, conf, infos)
+            val hit = CallSiteResolver.tablesFor(n, value, conf, infos)
             InputRef(n, value, hit.firstOrNull())
         }
         return methods.associate { m ->
@@ -179,7 +186,8 @@ object MeasuredTestBuilder {
                     if (isName(n)) out.add(ImportRef(n, pkg.replace('.', '/')))
                 }
             } else {
-                val segs = body.split('.')
+                val cleanBody = body.removeSuffix("._")
+                val segs = cleanBody.split('.')
                 val idx = segs.indexOfLast { isName(it) }
                 if (idx >= 0) out.add(ImportRef(segs[idx], segs.take(idx).joinToString("/")))
             }
@@ -187,24 +195,30 @@ object MeasuredTestBuilder {
         return out.distinctBy { it.name }.filter { it.name != selfName }
     }
 
-    /**
-     * GenerateDataX -> GetDataX. Primero por nombre exacto; si no existe, cualquier GetData
-     * cuyo nombre contenga el mismo sufijo.
-     */
     private fun findGetData(index: Map<String, List<File>>, selfName: String): List<File> {
         val core = selfName.substringAfter("Generate", selfName).removePrefix("Data")
-        if (core.isEmpty()) return emptyList()
-        val exact = index["GetData$core"].orEmpty()
-        if (exact.isNotEmpty()) return exact.take(1)
-        return index.filterKeys { it.startsWith("GetData") && it.contains(core) }
-            .values.flatten().take(1)
+        if (core.isNotEmpty()) {
+            val exact = index["GetData$core"].orEmpty()
+            if (exact.isNotEmpty()) return exact.take(1)
+            val byCore = index.filterKeys { it.startsWith("GetData") && it.contains(core) }
+                .values.flatten()
+            if (byCore.isNotEmpty()) return byCore.take(1)
+        }
+        val mapDef = Regex("""def\s+\w+[^=\n]*Map\[\s*String\s*,\s*DataFrame\s*\]""")
+        return index.values.flatten()
+            .filter { f ->
+                f.nameWithoutExtension != selfName &&
+                        !f.path.replace("\\", "/").contains("/src/test/") &&
+                        try { mapDef.containsMatchIn(f.readText()) } catch (_: Exception) { false }
+            }
+            .take(1)
     }
 
     private fun findCompanions(basePath: File, sourceFile: File, fullSource: String, selfName: String): Companions {
         val refs = importRefs(fullSource, selfName)
+        val usedConstants = CallSiteResolver.extractConstantTokens(fullSource)
 
         val skip = setOf("target", ".git", ".idea", "node_modules", "build", "out")
-        // El proyecto puede estar en una ruta muy larga: se recorre con ruta corta
         val root = LongPaths.resolve(basePath, true)
         val index = HashMap<String, MutableList<File>>()
         try {
@@ -214,10 +228,8 @@ object MeasuredTestBuilder {
                 }
             }
         } catch (ex: Exception) {
-            // sin índice: la IA trabaja solo con el código fuente
         }
 
-        // Elección DETERMINÍSTICA: package del import > fuera de src/test > orden alfabético de ruta.
         fun pick(ref: ImportRef): File? {
             val c = (index[ref.name] ?: return null).sortedBy { it.path }
             return c.firstOrNull {
@@ -226,20 +238,34 @@ object MeasuredTestBuilder {
             ?: c.first()
         }
 
-        val all = refs.mapNotNull { pick(it) }.distinct()
-        val imported = all.take(3)
+        val siblingDir = sourceFile.parentFile?.let { LongPaths.resolve(it, true) }
+        val sameFolderFiles = (siblingDir?.listFiles() ?: emptyArray<File>())
+            .filter { it.isFile && it.extension == "scala" && it.name != sourceFile.name }
+            .sortedBy { it.name }
+
+        val constantProviderFiles = index.values.flatten()
+            .filter { f ->
+                f.name != sourceFile.name &&
+                        !f.path.replace("\\", "/").contains("/src/test/") &&
+                        try {
+                            val vals = ParametryAssertGenerator.extractVals(f.readText())
+                            vals.isNotEmpty() && (usedConstants.isEmpty() || vals.any { it.name in usedConstants })
+                        } catch (_: Exception) {
+                            false
+                        }
+            }
+            .distinct()
+
+        val all = (refs.mapNotNull { pick(it) } + constantProviderFiles + sameFolderFiles).distinct()
+        val imported = (refs.mapNotNull { pick(it) } + constantProviderFiles).distinct().take(4)
         val getData = findGetData(index, selfName)
 
         val mapDef = Regex("""def\s+\w+[^=\n]*Map\[\s*String\s*,\s*DataFrame\s*\]""")
-        val siblingDir = sourceFile.parentFile?.let { LongPaths.resolve(it, true) }
-        val siblings = (siblingDir?.listFiles() ?: emptyArray<File>())
-            .sortedBy { it.name }
+        val siblings = sameFolderFiles
             .filter { f ->
-                f.isFile && f.extension == "scala" &&
-                        f.name != sourceFile.name &&
-                        imported.none { it.name == f.name } &&
+                imported.none { it.name == f.name } &&
                         getData.none { it.name == f.name } &&
-                        mapDef.containsMatchIn(f.readText())
+                        try { mapDef.containsMatchIn(f.readText()) } catch (_: Exception) { false }
             }
             .take(2)
 
@@ -250,26 +276,64 @@ object MeasuredTestBuilder {
     // Prompt
     // ------------------------------------------------------------------
 
-    private fun siteSection(sites: Map<String, List<CallSiteResolver.Site>>): String {
-        if (sites.isEmpty()) return ""
+    private fun buildResolvedConstsSection(
+        fullSource: String,
+        constants: Map<String, String>,
+        listConsts: Map<String, List<String>>,
+        conf: String
+    ): String {
+        val used = CallSiteResolver.extractConstantTokens(fullSource)
+        if (used.isEmpty()) return ""
         val lines = ArrayList<String>()
-        lines.add("LLAMADAS REALES Y PARQUET QUE LEE CADA UNA (calculado por el plugin desde el código, las constantes y el .conf; es OBLIGATORIO):")
-        for ((_, list) in sites) {
+        lines.add("CONSTANTES Y VALORES DE .CONF YA RESUELTOS DETERMINÍSTICAMENTE POR EL PLUGIN (úsalo tal cual en tus sondas SQL):")
+        for (c in used) {
+            val list = listConsts[c]
+            val str = constants[c]
+            when {
+                list != null -> lines.add("- $c (List[${list.size} columnas]) = ${list.joinToString(", ") { "\"$it\"" }}")
+                str != null -> {
+                    val confVal = CallSiteResolver.resolveConfScalar(str, conf)
+                    val extra = if (confVal != null && confVal != str) "  -> valor en .conf: \"$confVal\"" else ""
+                    lines.add("- $c = \"$str\"$extra")
+                }
+            }
+        }
+        return if (lines.size > 1) lines.joinToString("\n") else ""
+    }
+
+    private fun siteSection(
+        sites: Map<String, List<CallSiteResolver.Site>>,
+        preProbes: Map<String, ParquetProbe.Probe>,
+        preMeasured: Map<String, ParquetProbe.Measure>
+    ): String {
+        if (sites.isEmpty() && preProbes.isEmpty()) return ""
+        val lines = ArrayList<String>()
+        lines.add("LLAMADAS REALES, PARQUET Y SONDAS DUCKDB PRE-CALCULADAS POR EL PLUGIN (ES OBLIGATORIO USARLAS TAL CUAL):")
+        for ((method, list) in sites) {
             list.forEachIndexed { i, s ->
                 val t = if (s.tables.isEmpty()) {
-                    "(no resuelto: elige tú la tabla por nombre y columnas)"
+                    "(elige la tabla por nombre y columnas)"
                 } else {
                     "tabla SQL: " + s.tables.joinToString(", ")
                 }
-                lines.add("- ${if (i == 0) "[USAR ESTA] " else ""}${s.call}  ->  $t")
+                val colsInfo = if (s.columns.isNotEmpty()) {
+                    " | SELECT exacto (${s.columns.size} cols): ${s.columns.joinToString(", ")}"
+                } else ""
+                lines.add("- ${if (i == 0) "[USAR ESTA] " else ""}${s.call}  ->  $t$colsInfo")
+            }
+            val pre = preProbes[method]
+            val meas = preMeasured[method]
+            if (pre != null && meas != null) {
+                lines.add("  [SONDA DUCKDB YA VERIFICADA PARA $method (${meas.rows} filas, ${meas.cols} cols) — cópiala tal cual bajo @@PROBE $method]:")
+                lines.add("  @@PROBE $method")
+                lines.add("  ${pre.code}")
             }
         }
         lines.add("")
-        lines.add("Reglas de esta sección:")
-        lines.add("a) En el test llama al método con la llamada marcada [USAR ESTA] (o, si no hay marca, la única), copiada literal: mismos argumentos.")
-        lines.add("   Si la llamada contiene otras llamadas (por ejemplo failIfEmpty(getMasterPunished(...), X)), en el test puedes anteponer getObjectProcess. a cada método, y nada más.")
-        lines.add("b) La sonda de ese método lee SOLO la(s) tabla(s) indicada(s) para esa llamada. Nunca otra, aunque tenga columnas parecidas.")
-        lines.add("c) En el FROM escribe solo el nombre de la tabla, sin esquema (nada de co_master.). Si el SQL usa otra tabla de la lista de parquet, tu respuesta será rechazada.")
+        lines.add("Reglas obligatorias de esta sección:")
+        lines.add("a) En @@TEST llama a cada método exactamente con la llamada marcada [USAR ESTA] (mismos nombres de constantes, SIN anteponer el nombre del object de constantes porque ya está importado con ._).")
+        lines.add("b) Si el método tiene una [SONDA DUCKDB YA VERIFICADA], copia exactamente ese @@PROBE <metodo> y usa {{ROWS:<metodo>}} y {{COLS:<metodo>}} en el test.")
+        lines.add("c) Para cualquier otro método sin sonda pre-calculada, escribe la sonda SQL seleccionando EXACTAMENTE las columnas de la constante List[String] y leyendo la tabla indicada.")
         return lines.joinToString("\n")
     }
 
@@ -299,6 +363,7 @@ object MeasuredTestBuilder {
         infos: List<ParquetProbe.Info>,
         testable: List<Method>,
         mapSizes: Map<String, Int>,
+        resolvedConstsText: String,
         siteText: String,
         inputsText: String
     ): String {
@@ -336,7 +401,7 @@ object MeasuredTestBuilder {
             "",
             "TIPO DE TEST: $testType",
             "",
-            "CÓDIGO A PROBAR (clase ${spec.sourceName}, package $pkg):",
+            "CÓDIGO A PROBAR (clase ${spec.sourceName}, package del test: $pkg):",
             code,
             "",
             "ARCHIVOS ASOCIADOS (constantes, clases relacionadas y GetData):",
@@ -345,7 +410,9 @@ object MeasuredTestBuilder {
             "ARCHIVO .conf DEL TEST (úsalo solo para conocer valores de config como año o mes):",
             configText.take(8000).ifBlank { "(vacío)" },
             "",
-            "PARQUET DE MUESTRA, YA LEÍDOS (cada uno es una tabla SQL con ese nombre; filas y columnas reales):",
+            resolvedConstsText,
+            "",
+            "PARQUET DE MUESTRA, YA LEÍDOS EN DUCKDB (cada uno es una tabla SQL con ese nombre; filas y columnas reales):",
             parquetLines,
             "",
             "MÉTODOS QUE DEBES CUBRIR EN ESTA RESPUESTA (todos, ninguno se puede omitir):",
@@ -363,26 +430,22 @@ object MeasuredTestBuilder {
             "",
             "Reglas de las sondas:",
             "- Es SQL, no Scala. Una sola sentencia SELECT (o WITH ... SELECT), sin punto y coma final.",
-            "- La clave de cada sonda es exactamente el nombre del método (ej: @@PROBE joinFinal).",
+            "- La clave de cada sonda es exactamente el nombre del método (ej: @@PROBE getDefaultMasterTable).",
+            "- Si arriba se te dio una [SONDA DUCKDB YA VERIFICADA] para el método, cópiala EXACTAMENTE igual.",
             "- Las tablas disponibles son EXACTAMENTE los nombres de la lista de parquet de arriba: escríbelos en el FROM",
             "  (por ejemplo: FROM nombre_del_parquet). No uses rutas, read_parquet, esquemas ni ReaderWithDataproc.",
             "- No inventes tablas. Si un input de la sección INPUTS dice SIN PARQUET, no escribas sonda para ese método.",
             pickRule,
             "  Si el método usa varios inputs, haz el JOIN o la consulta entre varias tablas.",
             "- Copia la lógica del método tal cual (mismos select, trim, filtros, joins, fechas, agregaciones).",
-            "- Las constantes de Scala (listas de columnas, nombres de columnas, claves) NO existen en SQL: reemplázalas por",
-            "  sus valores LITERALES tomados de los archivos asociados. Igual con config.getString(X): usa el valor literal del .conf.",
+            "- Usa las columnas exactas de la sección CONSTANTES Y VALORES DE .CONF YA RESUELTOS. Nunca uses SELECT * si el método selecciona una lista de columnas.",
             "- Equivalencias Spark -> DuckDB: trim(col) -> trim(CAST(col AS VARCHAR)); lpad(col, n, '0') -> lpad(CAST(col AS VARCHAR), n, '0');",
             "  concat(a, b) -> concat(CAST(a AS VARCHAR), CAST(b AS VARCHAR)); col.as(x) -> col AS x; lit('x') -> 'x'.",
             "- DuckDB NO convierte tipos automáticamente (Spark sí). En COALESCE, CASE WHEN, UNION, IN y comparaciones, los dos lados",
-            "  deben tener el MISMO tipo. Si mezclas columnas de distinto tipo (DATE, TIMESTAMP, números, texto) o una columna con un",
-            "  literal de otro tipo (por ejemplo COALESCE(fecha, '')), castea TODO de forma explícita:",
-            "  COALESCE(CAST(a AS VARCHAR), CAST(b AS VARCHAR), '') o COALESCE(CAST(a AS DATE), CAST(b AS DATE)).",
-            "- Si no conoces el tipo real de una columna, castea a VARCHAR en ambos lados antes de mezclarlas o compararlas.",
+            "  deben tener el MISMO tipo. Si mezclas columnas de distinto tipo o una columna con un literal, castea TODO de forma explícita a VARCHAR o DATE.",
             "- Filtrar por la partición máxima se escribe con subconsulta, por ejemplo:",
             "  SELECT <columnas> FROM <tabla> WHERE <expresión_partición> = (SELECT max(<expresión_partición>) FROM <tabla>)",
-            "  y si además hay un corte (<= valor), agrégalo en el WHERE de ambos lados.",
-            "- Los nombres de columnas del resultado deben ser los mismos que produce el método (importa el NÚMERO de columnas).",
+            "  y si además hay un corte (<= valor), agrégalo en el WHERE de la subconsulta.",
             "- La clave es única (letras, números y _).",
             "",
             "PARTE 2 - TEST:",
@@ -390,8 +453,7 @@ object MeasuredTestBuilder {
             "<la clase de test completa>",
             "",
             "Reglas del test:",
-            "1. Usa EXACTAMENTE este header (ya tiene package, imports base, clase y config correctos; no los cambies,",
-            "   solo agrega los imports adicionales que realmente uses):",
+            "1. Usa EXACTAMENTE este header (ya tiene el package de destino, imports del proyecto, clase y config correctos; no los cambies ni los borres):",
             "",
             header,
             "",
@@ -401,14 +463,14 @@ object MeasuredTestBuilder {
             "",
             "3. PROHIBIDO escribir a mano cantidades de filas, columnas o elementos. Usa SOLO los placeholders",
             "   {{ROWS:clave}}, {{COLS:clave}} (claves de tus sondas) y {{MAPSIZE:metodo}}; el sistema los reemplaza por los",
-            "   valores medidos. Escribe {{N}} como número de cada test; el sistema numera.",
+            "   valores medidos en DuckDB. Escribe {{N}} como número de cada test; el sistema numera.",
             "4. Un test por cada método de la lista. No inventes métodos, constantes ni rutas.",
             "5. Sin TODO ni comentarios de relleno.",
-            "6. Si el método tiene llamadas reales listadas arriba, el test usa EXACTAMENTE una de ellas (mismos argumentos).",
+            "6. Si el método tiene llamadas reales listadas arriba, el test usa EXACTAMENTE la llamada marcada [USAR ESTA] con los nombres de las constantes directos (sin anteponer el nombre del object de constantes, pues ya está importado con ._).",
             "7. Termina la respuesta con la llave que cierra la clase. No cortes la respuesta a la mitad.",
             "8. Para leer un parquet usa la ruta relativa EXACTA de la lista PARQUET DE MUESTRA, con el nombre completo de la carpeta (incluido el sufijo partition_...). Nunca la acortes.",
             "9. En las sondas SQL, nunca uses como tabla el nombre de otro método ni sufijos como _src. Escribe la consulta completa desde los parquet de la lista.",
-            "10. Antes de usar una columna en un SELECT, JOIN o WHERE, verifica que exista en la lista de columnas (con su tipo) del parquet correspondiente. Si no existe, no la uses."
+            "10. Antes de usar una columna en un SELECT, JOIN o WHERE, verifica que exista en la lista de columnas (con su tipo) del parquet correspondiente."
         ).joinToString("\n")
     }
 
@@ -416,7 +478,31 @@ object MeasuredTestBuilder {
     // Respuesta de la IA
     // ------------------------------------------------------------------
 
-    private fun parse(resp: String): Parsed {
+    private fun normalizeTestCalls(test: String, sites: Map<String, List<CallSiteResolver.Site>>): String {
+        var out = CallSiteResolver.stripConstQualifiers(test)
+        if (sites.isEmpty()) return out
+
+        for ((method, methodSites) in sites) {
+            if (methodSites.isEmpty()) continue
+            val callRegex = Regex("""(\bgetObjectProcess\s*\.\s*${Regex.escape(method)}\s*)\(""")
+            val matches = callRegex.findAll(out).toList().asReversed()
+            for (m in matches) {
+                val openParen = m.range.last
+                val inner = CallSiteResolver.balancedInner(out, openParen) ?: continue
+                val normInner = CallSiteResolver.normArgs(inner)
+                val matchedSite = methodSites.firstOrNull { it.normArgs == normInner }
+                if (matchedSite != null) {
+                    out = out.substring(0, openParen + 1) + matchedSite.args + out.substring(openParen + 1 + inner.length)
+                } else {
+                    val primary = methodSites.first()
+                    out = out.substring(0, openParen + 1) + primary.args + out.substring(openParen + 1 + inner.length)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun parse(resp: String, sites: Map<String, List<CallSiteResolver.Site>> = emptyMap()): Parsed {
         val probes = ArrayList<ParquetProbe.Probe>()
         val test = StringBuilder()
         val code = StringBuilder()
@@ -447,10 +533,10 @@ object MeasuredTestBuilder {
             }
         }
         flush()
-        return Parsed(probes.distinctBy { it.key }, test.toString().trim())
+        val normalizedTest = normalizeTestCalls(test.toString().trim(), sites)
+        return Parsed(probes.distinctBy { it.key }, normalizedTest)
     }
 
-    /** Llaves y paréntesis cerrados y clase completa. Detecta respuestas cortadas por la IA. */
     private fun balanced(src: String): Boolean {
         if (!Regex("""class\s+\w+\s+extends""").containsMatchIn(src)) return false
         var depth = 0
@@ -475,7 +561,7 @@ object MeasuredTestBuilder {
         return depth == 0
     }
 
-    private fun staticIssues(p: Parsed, testable: List<Method>): List<String> {
+    private fun staticIssues(p: Parsed, testable: List<Method>, preMeasured: Map<String, ParquetProbe.Measure>): List<String> {
         val out = ArrayList<String>()
         if (!Regex("""class\s+\w+\s+extends""").containsMatchIn(p.test)) {
             out.add("La parte @@TEST no contiene la clase de test completa.")
@@ -493,7 +579,7 @@ object MeasuredTestBuilder {
             out.add("Hay cantidades escritas a mano; usa solo {{ROWS:..}}, {{COLS:..}} y {{MAPSIZE:..}}.")
         }
         if (p.test.contains("TODO")) out.add("El test contiene TODO.")
-        val keys = p.probes.map { it.key }.toSet()
+        val keys = p.probes.map { it.key }.toSet() + preMeasured.keys
         PH.findAll(p.test).forEach { m ->
             if (m.groupValues[1] != "MAPSIZE" && m.groupValues[2] !in keys) {
                 out.add("El placeholder ${m.value} no tiene sonda con esa clave.")
@@ -507,10 +593,9 @@ object MeasuredTestBuilder {
     }
 
     // ------------------------------------------------------------------
-    // Verificación semántica: llamada del test + tablas de la sonda == lo que dice el código
+    // Verificación semántica sobre lo que midió DuckDB
     // ------------------------------------------------------------------
 
-    /** Tablas (parquet de muestra) que lee el SQL; acepta FROM tabla, "tabla" y esquema.tabla. */
     private fun tablesOf(sql: String, infos: List<ParquetProbe.Info>): Set<String> {
         val byLower = infos.associateBy { it.name.lowercase() }
         return FROM_REGEX.findAll(sql)
@@ -534,7 +619,11 @@ object MeasuredTestBuilder {
         val notes = ArrayList<String>()
         val measures = LinkedHashMap(raw.measures)
         val errors = LinkedHashMap(raw.errors)
-        val probeByKey = p.probes.associateBy { it.key }
+
+        for ((k, m) in ctx.preMeasured) {
+            measures.putIfAbsent(k, m)
+        }
+        val probeByKey = (ctx.preProbes.values + p.probes).associateBy { it.key }
 
         // 1) Rutas de parquet inventadas en el test
         val known = ctx.infos.map { it.relPath.replace("\\", "/").trimEnd('/') }
@@ -544,7 +633,7 @@ object MeasuredTestBuilder {
             if (!ok) issues.add("El test lee la ruta \"$path\" que no está entre los parquet de muestra.")
         }
 
-        // 2) Llamada del test == llamada real del código, y sonda sobre las tablas de esa llamada.
+        // 2) Llamada del test == llamada real del código
         if (ctx.sites.isNotEmpty()) {
             for (block in testBlocks(p.test)) {
                 val blockKeys = PH.findAll(block)
@@ -572,8 +661,23 @@ object MeasuredTestBuilder {
                             continue
                         }
 
+                        val detMeasure = ctx.preMeasured[method]
+                        if (detMeasure != null) {
+                            blockKeys.forEach { k ->
+                                measures[k] = detMeasure
+                                errors.remove(k)
+                            }
+                            continue
+                        }
+
                         if (site.tables.isEmpty()) {
-                            notes.add("No se pudo verificar contra qué parquet lee ${site.call}; revísalo a mano.")
+                            val anyValidTable = blockKeys.any { k ->
+                                val probe = probeByKey[k]
+                                probe != null && tablesOf(probe.code, ctx.infos).isNotEmpty()
+                            }
+                            if (!anyValidTable) {
+                                notes.add("No se pudo verificar contra qué parquet lee ${site.call}; revísalo a mano.")
+                            }
                             continue
                         }
 
@@ -595,14 +699,14 @@ object MeasuredTestBuilder {
     }
 
     private fun attempt(prompt: String, ctx: Ctx): Attempt {
-        val parsed = parse(ctx.askAi(prompt))
-        val issues = ArrayList(staticIssues(parsed, ctx.testable))
+        val parsed = parse(ctx.askAi(prompt), ctx.sites)
+        val issues = ArrayList(staticIssues(parsed, ctx.testable, ctx.preMeasured))
         val raw = ParquetProbe.runProbes(parsed.probes, ctx.infos)
         val v = verifySites(parsed, raw, ctx)
         issues.addAll(v.issues)
         val res = v.res
 
-        val probeKeys = parsed.probes.map { it.key }.toSet()
+        val probeKeys = parsed.probes.map { it.key }.toSet() + ctx.preMeasured.keys
         val used = PH.findAll(parsed.test)
             .filter { it.groupValues[1] != "MAPSIZE" }
             .map { it.groupValues[2] }
@@ -620,10 +724,6 @@ object MeasuredTestBuilder {
     private fun blockTitleHas(block: String, method: String): Boolean =
         Regex("\"[^\"\\n]*\\b" + Regex.escape(method) + "\\b[^\"\\n]*\"\\s+should").containsMatchIn(block)
 
-    /**
-     * Agrega, al final de la clase, el test de cada compuesto usando la misma clave de sonda
-     * que su último paso. Así ambos muestran exactamente los mismos números.
-     */
     private fun injectComposites(raw: String, comps: Map<String, String>, sourceName: String): String {
         var out = raw
         for ((c, l) in comps) {
@@ -659,21 +759,24 @@ object MeasuredTestBuilder {
     private fun generateBatch(job: Job, batch: List<Method>): BatchResult {
         val names = batch.map { it.name }.toSet()
         val sites = job.sites.filterKeys { it in names }
+        val preProbes = job.preProbes.filterKeys { it in names }
+        val preMeasured = job.preMeasured.filterKeys { it in names }
         val inputs = job.inputs.filterKeys { it in names }
         val mapSizes = job.mapSizes.filterKeys { it in names }
 
         val prompt = buildPrompt(
             job.testType, job.pkg, job.spec, job.header, job.pattern, job.code,
             job.companionsText, job.configText, job.infos, batch, mapSizes,
-            siteSection(sites), inputsSection(inputs)
+            job.resolvedConstsText,
+            siteSection(sites, preProbes, preMeasured),
+            inputsSection(inputs)
         )
-        val ctx = Ctx(batch, job.infos, job.askAi, sites)
+        val ctx = Ctx(batch, job.infos, job.askAi, sites, preMeasured, preProbes)
 
         var best = attempt(prompt, ctx)
         var tries = 1
 
         while (best.issues.isNotEmpty() && tries < MAX_TRIES) {
-            // Sondas que DuckDB rechazó: se devuelven con su SQL exacto y el error literal
             val failedSql = best.parsed.probes
                 .filter { it.key in best.res.errors.keys }
                 .joinToString("\n\n") { p ->
@@ -690,7 +793,7 @@ object MeasuredTestBuilder {
                 val next = attempt(retryPrompt, ctx)
                 if (next.issues.size <= best.issues.size) best = next
             } catch (ex: Exception) {
-                break // se conserva el mejor intento
+                break
             }
             tries++
         }
@@ -704,7 +807,6 @@ object MeasuredTestBuilder {
             )
         }
 
-        // Si la IA omitió algún método del lote, se marca como fallido para reintentarlo por separado.
         val omitted = batch.filter { m ->
             !Regex("""\b${Regex.escape(m.name)}\b""").containsMatchIn(best.parsed.test)
         }
@@ -736,7 +838,8 @@ object MeasuredTestBuilder {
             .toList()
         val measured = usedKeys.mapNotNull { k ->
             val m = best.res.measures[k] ?: return@mapNotNull null
-            val sql = best.parsed.probes.firstOrNull { it.key == k }?.code.orEmpty()
+            val sql = (best.parsed.probes.firstOrNull { it.key == k } ?: preProbes[k]
+            ?: preProbes.values.firstOrNull { k.startsWith(it.key) })?.code.orEmpty()
             val pqs = tablesOf(sql, job.infos).joinToString(", ")
             "$k: ${m.rows} filas x ${m.cols} columnas" + if (pqs.isNotEmpty()) " (parquet: $pqs)" else ""
         }
@@ -744,7 +847,6 @@ object MeasuredTestBuilder {
         return BatchResult(test, true, problems, measured)
     }
 
-    /** Si un lote falla, reintenta cada método por separado. */
     private fun runBatch(job: Job, batch: List<Method>): List<BatchResult> {
         val first = try {
             generateBatch(job, batch)
@@ -770,7 +872,6 @@ object MeasuredTestBuilder {
         }
     }
 
-    /** Separa la cabecera de la clase y sus bloques de test. */
     private fun splitParts(test: String): Pair<String, List<String>> {
         val starts = BLOCK_START.findAll(test).map { it.range.first }.toList()
         if (starts.isEmpty()) return test to emptyList()
@@ -781,23 +882,34 @@ object MeasuredTestBuilder {
         return header to blocks
     }
 
-    /** Une los lotes: cabecera del primero + los bloques de todos, y una sola llave de cierre. */
-    private fun mergeParts(parts: List<String>): String {
+    private fun mergeParts(parts: List<String>, templateHeader: String): String {
         if (parts.isEmpty()) return ""
-        val header = splitParts(parts.first()).first.trimEnd()
+        val baseHeader = splitParts(templateHeader).first
+            .replace("// AQUÍ VAN LOS TESTS: uno por cada método de la lista.", "")
+            .replace("// AQUÍ VAN LOS TESTS: uno para el método principal (normalmente \"apply\")", "")
+            .replace("// y uno por cada método de transformación de la lista.", "")
+            .trimEnd()
+            .removeSuffix("}")
+            .trimEnd()
+
+        val firstPartHeader = splitParts(parts.first()).first.trimEnd()
+        val headerToUse = if (Regex("""class\s+\w+\s+extends""").containsMatchIn(baseHeader)) {
+            baseHeader
+        } else {
+            firstPartHeader
+        }
+
         val blocks = ArrayList<String>()
         for (p in parts) {
             val (_, bs) = splitParts(p)
             val last = bs.size - 1
             bs.forEachIndexed { i, b ->
-                // Solo el último bloque de cada lote trae la llave que cierra la clase
                 blocks.add(if (i == last) b.removeSuffix("}").trimEnd() else b)
             }
         }
-        return header + "\n\n" + blocks.joinToString("\n\n") + "\n}\n"
+        return headerToUse + "\n\n" + blocks.joinToString("\n\n") + "\n}\n"
     }
 
-    /** Numera los tests consecutivamente (aunque cada lote haya empezado en 1). */
     private fun renumber(test: String): String {
         var n = 0
         var out = BLOCK_NUMBER.replace(test) { m ->
@@ -815,7 +927,6 @@ object MeasuredTestBuilder {
     // Armado final
     // ------------------------------------------------------------------
 
-    /** ¿La posición [pos] cae dentro de un literal "..." de su línea? */
     private fun insideString(text: String, pos: Int): Boolean {
         val ls = text.lastIndexOf('\n', pos - 1) + 1
         var inStr = false
@@ -846,22 +957,71 @@ object MeasuredTestBuilder {
                 value
             } else {
                 problems.add("No se pudo medir $kind de '$key'.")
-                // Dentro del texto del test no puede ir un comentario de código.
                 if (insideString(test, m.range.first)) "NO MEDIDO" else "-1 /* NO MEDIDO: $key */"
             }
         }
     }
 
-    /** Agrega los imports con comodín del código fuente (constantes) si la IA los olvidó. */
-    private fun addWildcardImports(test: String, fullSource: String): String {
-        val wanted = fullSource.lines().map { it.trim() }.filter { it.startsWith("import ") && it.endsWith("._") }
-        val lines = test.lines().toMutableList()
-        val missing = wanted.filter { w -> lines.none { it.trim() == w } }
-        if (missing.isEmpty()) return test
-        val idx = lines.indexOfLast { it.trim().startsWith("import ") }
-        if (idx < 0) return test
-        lines.addAll(idx + 1, missing)
-        return lines.joinToString("\n")
+    /**
+     * Fuerza que la declaración `package ...` del archivo generado sea SIEMPRE el paquete de la ruta de destino
+     * (`targetPkg`) y que estén todos los imports del proyecto (ContextProvider, clase bajo prueba si está en
+     * un paquete distinto a `targetPkg`, y wildcards `._`).
+     */
+    private fun ensureProjectImports(
+        testType: String,
+        test: String,
+        targetPkg: String,
+        spec: TestPromptBuilder.TestSpec,
+        fullSource: String,
+        basePath: File,
+        sourceFile: File
+    ): String {
+        val sourcePkg = TestPromptBuilder.extractPackage(fullSource).ifEmpty {
+            TestPromptBuilder.packageFromOutputPath(sourceFile)
+        }
+        val cpImport = TestPromptBuilder.resolveContextProviderImport(targetPkg, sourcePkg, basePath, sourceFile)
+        val sourceClassImport = if (sourcePkg.isNotEmpty() && sourcePkg != targetPkg) {
+            "import $sourcePkg.${spec.sourceName}"
+        } else {
+            ""
+        }
+        val extraImports = TestPromptBuilder.resolveExtraImports(testType, targetPkg, fullSource, spec, basePath, sourceFile)
+
+        // 1) Forzar que la línea `package ...` sea exactamente `package $targetPkg`
+        var cleaned = if (targetPkg.isNotEmpty()) {
+            if (Regex("""(?m)^\s*package\s+[A-Za-z0-9_.]+""").containsMatchIn(test)) {
+                Regex("""(?m)^\s*package\s+[A-Za-z0-9_.]+""").replaceFirst(test, "package $targetPkg")
+            } else {
+                "package $targetPkg\n\n$test"
+            }
+        } else {
+            test
+        }
+
+        // 2) Reemplazar cualquier import de ContextProvider incorrecto por el real del proyecto
+        if (cpImport.isNotEmpty()) {
+            cleaned = Regex("""(?m)^\s*import\s+[A-Za-z0-9_.]+\.ContextProvider\b""").replace(cleaned, cpImport)
+        }
+
+        val lines = cleaned.lines().toMutableList()
+        val required = (listOf(cpImport, sourceClassImport) + extraImports).filter { it.isNotBlank() }
+        val missing = required.filter { req -> lines.none { it.trim() == req } }
+        if (missing.isNotEmpty()) {
+            val firstImportIdx = lines.indexOfFirst { it.trim().startsWith("import ") }
+            val lastImportIdx = lines.indexOfLast { it.trim().startsWith("import ") }
+            if (firstImportIdx >= 0) {
+                // Insertar ContextProvider y la clase fuente al principio de los imports, y los wildcards al final
+                val topMissing = missing.filter { !it.endsWith("._") }
+                val bottomMissing = missing.filter { it.endsWith("._") }
+                if (bottomMissing.isNotEmpty()) {
+                    lines.addAll(lastImportIdx + 1, bottomMissing)
+                }
+                if (topMissing.isNotEmpty()) {
+                    lines.addAll(firstImportIdx, topMissing)
+                }
+            }
+        }
+        return CallSiteResolver.stripConstQualifiers(lines.joinToString("\n"))
     }
 
     fun build(
@@ -877,8 +1037,19 @@ object MeasuredTestBuilder {
         infos: List<ParquetProbe.Info>,
         focus: String,
         progress: (String) -> Unit,
-        askAi: (String) -> String
+        askAi: (String) -> String,
+        outputFileOrDir: File? = null
     ): Output {
+
+        val sourcePkg = TestPromptBuilder.extractPackage(fullSource).ifEmpty {
+            TestPromptBuilder.packageFromOutputPath(sourceFile)
+        }
+        // Resuelve el package real a partir de la ruta de salida (o del parámetro pkg si ya traía la ruta/paquete)
+        val targetPkg = if (outputFileOrDir != null) {
+            TestPromptBuilder.packageFromOutputPath(outputFileOrDir, pkg)
+        } else {
+            TestPromptBuilder.packageFromPathString(pkg, sourcePkg)
+        }
 
         val all = methods(code).filter { !it.isPrivate }.distinctBy { it.name }
         if (all.isEmpty()) throw IllegalStateException("No se encontraron métodos no privados en el código analizado.")
@@ -898,13 +1069,30 @@ object MeasuredTestBuilder {
                 "// $tag: ${f.name}\n" + f.readText().take(20000)
             }
 
-        progress("Resolviendo qué parquet lee cada llamada y cada input...")
-        val constants = CallSiteResolver.stringConstants(
-            listOf(fullSource) + (comp.all + comp.getData).distinct().take(15).map { it.readText() }
-        )
+        progress("Resolviendo constantes, .conf y ejecutando sondas deterministas en DuckDB...")
+        val allSourcesText = listOf(fullSource) + (comp.all + comp.getData).distinct().take(15).map { it.readText() }
+        val constants = CallSiteResolver.stringConstants(allSourcesText)
+        val listConsts = CallSiteResolver.listConstants(allSourcesText, constants)
+
         val sites: Map<String, List<CallSiteResolver.Site>> = if (testType == "GetData") {
-            CallSiteResolver.findSites(fullSource, testable.map { it.name }, constants, configText, infos)
+            CallSiteResolver.findSites(fullSource, testable.map { it.name }, constants, configText, infos, listConsts)
         } else emptyMap()
+
+        val detProbes = testable.mapNotNull { m ->
+            CallSiteResolver.buildDeterministicProbe(
+                method = m,
+                site = sites[m.name]?.firstOrNull(),
+                constants = constants,
+                listConsts = listConsts,
+                conf = configText,
+                infos = infos
+            )
+        }
+        val detRun = ParquetProbe.runProbes(detProbes, infos)
+        val preMeasured = detRun.measures
+        val preProbes = detProbes.filter { it.key in preMeasured }.associateBy { it.key }
+        val resolvedConstsText = buildResolvedConstsSection(fullSource, constants, listConsts, configText)
+
         val inputs = resolveInputs(testable, constants, configText, infos)
 
         val composites = if (testType == "Generate") detectComposites(testable) else emptyMap()
@@ -920,17 +1108,16 @@ object MeasuredTestBuilder {
                 else "La constante ${it.constName} (\"${it.table}\") no tiene parquet de muestra; los métodos que la usan no se pueden medir."
             )
         }
-        sites.values.flatten()
-            .filter { it.tables.isEmpty() && it.constants.any { c -> c in constants } }
-            .forEach { notes.add("No se pudo resolver el parquet de ${it.call}; revísalo a mano.") }
         composites.forEach { (c, l) ->
             notes.add("$c no se pidió a la IA: usa los mismos números que $l (su último paso). Si $l está mal, $c también.")
         }
 
-        val (header, pattern) = TestPromptBuilder.headerAndPattern(testType, pkg, spec, configRel)
+        val (header, pattern) = TestPromptBuilder.headerAndPattern(
+            testType, targetPkg, spec, configRel, fullSource, basePath, sourceFile, outputFileOrDir
+        )
         val job = Job(
             testType = testType,
-            pkg = pkg,
+            pkg = targetPkg,
             spec = spec,
             header = header,
             pattern = pattern,
@@ -940,15 +1127,20 @@ object MeasuredTestBuilder {
             infos = infos,
             mapSizes = mapSizes,
             sites = sites,
+            preMeasured = preMeasured,
+            preProbes = preProbes,
+            resolvedConstsText = resolvedConstsText,
             inputs = inputs,
             composites = composites,
             fullSource = fullSource,
+            sourceFile = sourceFile,
+            basePath = basePath,
             askAi = askAi
         )
 
         val batches = aiMethods.chunked(BATCH_SIZE)
         val results = batches.flatMapIndexed { i, batch ->
-            progress("Lote ${i + 1} de ${batches.size}: consultando a la IA y midiendo los parquet...")
+            progress("Lote ${i + 1} de ${batches.size}: consultando a la IA y midiendo los parquet en DuckDB...")
             runBatch(job, batch)
         }
 
@@ -960,8 +1152,8 @@ object MeasuredTestBuilder {
             )
         }
 
-        var merged = mergeParts(okParts)
-        merged = addWildcardImports(merged, fullSource)
+        var merged = mergeParts(okParts, header)
+        merged = ensureProjectImports(testType, merged, targetPkg, spec, fullSource, basePath, sourceFile)
         merged = renumber(merged)
 
         val missing = testable

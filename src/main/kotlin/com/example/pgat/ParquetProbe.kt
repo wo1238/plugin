@@ -49,10 +49,16 @@ object ParquetProbe {
         return out
     }
 
+    /**
+     * Devuelve la ruta relativa empezando desde `src/...` (sin anteponer el nombre del submódulo
+     * cuando el proyecto se abre desde una carpeta raíz multimódulo).
+     */
     private fun relative(d: File, base: File): String {
         val a = d.absolutePath.replace("\\", "/")
         val b = base.absolutePath.replace("\\", "/").trimEnd('/') + "/"
-        return if (a.startsWith(b)) a.removePrefix(b) else a
+        val rel = if (a.startsWith(b)) a.removePrefix(b) else a
+        val srcIdx = rel.indexOf("src/")
+        return if (srcIdx >= 0) rel.substring(srcIdx) else rel
     }
 
     private fun connect(): Connection =
@@ -62,7 +68,42 @@ object ParquetProbe {
     private fun q(name: String) = "\"" + name.replace("\"", "\"\"") + "\""
     private fun lit(s: String) = "'" + s.replace("'", "''") + "'"
 
+    /** Detecta los nombres de las columnas de partición Hive (carpetas clave=valor) dentro de un dataset. */
+    private fun detectHivePartitions(datasetDir: File): List<String> {
+        val parts = LinkedHashSet<String>()
+        fun walkPart(d: File, depth: Int) {
+            if (depth > 6) return
+            val kids = d.listFiles() ?: return
+            for (k in kids) {
+                if (k.isDirectory && !k.name.startsWith("_") && !k.name.startsWith(".")) {
+                    if (k.name.contains("=")) {
+                        val col = k.name.substringBefore("=").trim()
+                        if (col.isNotEmpty()) parts.add(col)
+                    }
+                    walkPart(k, depth + 1)
+                }
+            }
+        }
+        walkPart(datasetDir, 0)
+        return parts.toList()
+    }
+
+    /**
+     * Crea la vista en DuckDB leyendo las particiones Hive como VARCHAR para conservar ceros a la izquierda
+     * ('01', '02', etc.) igual que Spark/Dataproc; si falla por esquema, hace fallback automático.
+     */
     private fun createView(conn: Connection, name: String, absPath: String) {
+        val parts = detectHivePartitions(File(absPath))
+        if (parts.isNotEmpty()) {
+            val hiveTypes = parts.joinToString(", ") { "${lit(it)}: 'VARCHAR'" }
+            val typedSql = "CREATE OR REPLACE VIEW ${q(name)} AS SELECT * FROM read_parquet(" +
+                    "${lit("$absPath/**/*.parquet")}, hive_partitioning=true, union_by_name=true, hive_types={$hiveTypes})"
+            try {
+                conn.createStatement().use { st -> st.execute(typedSql) }
+                return
+            } catch (_: Exception) {
+            }
+        }
         conn.createStatement().use { st ->
             st.execute(
                 "CREATE OR REPLACE VIEW ${q(name)} AS SELECT * FROM read_parquet(" +
@@ -95,7 +136,6 @@ object ParquetProbe {
 
         connect().use { conn ->
             for (root in uniqueRoots) {
-                // Ruta corta para DuckDB; la original se conserva para mostrársela al usuario.
                 val view = LongPaths.resolve(root, true)
                 if (!view.isDirectory) throw IllegalStateException("La carpeta de parquet no existe: ${root.path}")
                 val dirs = listDatasets(view)
@@ -106,9 +146,8 @@ object ParquetProbe {
 
                 for (d in dirs) {
                     val abs = d.absolutePath.replace("\\", "/")
-                    if (!seen.add(abs.lowercase())) continue // ya leído desde otra carpeta
+                    if (!seen.add(abs.lowercase())) continue
 
-                    // Nombre de la tabla = lo que va antes del primer punto (lo demás es la partición)
                     val nm = d.name.substringBefore('.').ifEmpty { root.name }
                     val base = sqlName(nm)
                     var name = base
@@ -118,7 +157,10 @@ object ParquetProbe {
                         i++
                     }
                     val sub = abs.removePrefix(viewRoot).trimStart('/')
-                    val rel = if (sub.isEmpty()) rootRel else "$rootRel/$sub"
+                    val rawRel = if (sub.isEmpty()) rootRel else "$rootRel/$sub"
+                    val srcIdx = rawRel.indexOf("src/")
+                    val rel = if (srcIdx >= 0) rawRel.substring(srcIdx) else rawRel
+
                     try {
                         createView(conn, name, abs)
                         val rows = conn.createStatement().use { st ->
@@ -149,7 +191,7 @@ object ParquetProbe {
         return Inspection(infos, errors)
     }
 
-    /** Ejecuta las sondas (SQL) sobre los parquet. Cada sonda falla de forma independiente. */
+    /** Ejecuta las sondas (SQL) sobre los parquet en DuckDB. Cada sonda falla de forma independiente. */
     fun runProbes(probes: List<Probe>, infos: List<Info>): RunResult {
         if (probes.isEmpty()) return RunResult(emptyMap(), emptyMap())
 
@@ -161,7 +203,6 @@ object ParquetProbe {
                 try {
                     createView(conn, info.name, info.absPath)
                 } catch (ex: Exception) {
-                    // el parquet ya falló en inspect; las sondas que lo usen reportarán el error
                 }
             }
 

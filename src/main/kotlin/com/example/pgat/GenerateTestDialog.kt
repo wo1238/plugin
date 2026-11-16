@@ -20,7 +20,7 @@ import javax.swing.JSeparator
 import javax.swing.JTextField
 
 class GenerateTestDialog(
-    basePath: String,
+    private val basePath: String,
     initialSourcePath: String,
     hasSelection: Boolean
 ) : DialogWrapper(true) {
@@ -61,6 +61,27 @@ class GenerateTestDialog(
             add(label, BorderLayout.WEST)
             add(field, BorderLayout.CENTER)
         }
+
+    /**
+     * Deduce el directorio de salida por defecto en `src/test/scala/...` a partir del archivo fuente
+     * o de la estructura real del proyecto (sin rutas quemadas).
+     */
+    private fun resolveDefaultTestOutputDir(sourcePath: String): String {
+        val normSource = sourcePath.replace("\\", "/").trim()
+        if (normSource.isNotEmpty()) {
+            val f = File(normSource)
+            val dirPath = (if (f.name.endsWith(".scala", ignoreCase = true)) f.parent else normSource)
+                .orEmpty()
+                .replace("\\", "/")
+            if (dirPath.contains("/src/main/scala/")) {
+                return dirPath.replaceFirst("/src/main/scala/", "/src/test/scala/").trimEnd('/') + "/"
+            }
+            if (dirPath.contains("/src/test/scala/")) {
+                return dirPath.trimEnd('/') + "/"
+            }
+        }
+        return "$basePath/src/test/scala/"
+    }
 
     init {
         title = "Generar Test Unitario (ScalaTest)"
@@ -108,7 +129,7 @@ class GenerateTestDialog(
             ?.let { File(cfgDir, it.name).path }
             ?: ""
 
-        txtTestOutputPath.text = "$basePath/src/test/scala/com/bbva/co/csan/data/"
+        txtTestOutputPath.text = resolveDefaultTestOutputDir(initialSourcePath)
         chkUseSelection.isEnabled = hasSelection
 
         rbTestGenerate.addActionListener { updateState() }
