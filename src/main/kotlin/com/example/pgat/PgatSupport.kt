@@ -15,7 +15,7 @@ object AiClient {
     // El MISMO valor que pusiste en PROXY_SECRET del Worker (usa uno nuevo, no el anterior)
     private const val PROXY_SECRET = "a8f3k2x9q7m1z5"
     // El Worker fuerza este modelo de todos modos; aquí solo es referencia
-    private const val MODEL = "claude-haiku-5-5"
+    private const val MODEL = "claude-sonnet-5-5"
 
     fun ask(prompt: String): String {
         val model = AnthropicChatModel.builder()
